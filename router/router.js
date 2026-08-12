@@ -710,6 +710,42 @@ async function handleStatus(env, shardUrls) {
   })
 }
 
+// ─── POST /server_hello — prove Router identity to a connecting client ────────
+//
+// The client generates a fresh random nonce and POSTs it here. The Router
+// signs a payload binding the nonce, protocol version, its own public key,
+// and a timestamp — proving it holds the Router's private key without
+// revealing that key. The client verifies using the Router's well-known
+// ROUTER_SIGNING_PUBLIC (from the routing table or a hardcoded trust anchor).
+// Prevents replay: each signed response is bound to the nonce the client
+// chose, so a captured response cannot be reused for a different challenge.
+async function handleServerHello(request, env) {
+  let body
+  try { body = await request.json() } catch { return jsonErr("Request body must be valid JSON", 400) }
+  const { nonce, protocol = "nextalk/v1" } = body || {}
+  if (!nonce || typeof nonce !== "string" || nonce.length < 8 || nonce.length > 256) {
+    return jsonErr("nonce must be a non-empty string (8–256 chars)", 400)
+  }
+  if (typeof protocol !== "string" || protocol.length > 32) {
+    return jsonErr("protocol must be a short identifier string", 400)
+  }
+  const timestamp = String(Date.now())
+  // Signed payload binds: protocol, client nonce, server public key, timestamp.
+  // A different server cannot produce a valid signature for these exact inputs.
+  const signedPayload = `NexTalk Server Authentication:${protocol}:${nonce}:${env.ROUTER_SIGNING_PUBLIC}:${timestamp}`
+  const signingKey = await importSigningKey(env.ROUTER_SIGNING_KEY)
+  const signature = await signHex(signingKey, signedPayload)
+  return jsonOk({
+    version: 1,
+    type: "server_hello",
+    protocol,
+    server_public_key: env.ROUTER_SIGNING_PUBLIC,
+    challenge: nonce,
+    timestamp,
+    signature,
+  })
+}
+
 // ─── Main fetch handler ──────────────────────────────────────────────────────
 
 export default {
@@ -770,6 +806,9 @@ export default {
       }
       if (url.pathname === "/status" && request.method === "GET") {
         return await handleStatus(env, shardUrls)
+      }
+      if (url.pathname === "/server_hello" && request.method === "POST") {
+        return await handleServerHello(request, env)
       }
       if (url.pathname === "/pow_challenge" && request.method === "GET") {
         return await handlePowChallenge(request, env)

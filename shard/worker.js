@@ -886,6 +886,42 @@ async function handleRoutingTableServe(env) {
   })
 }
 
+// ─── POST /server_hello — prove shard identity to a connecting client ─────────
+//
+// The client generates a fresh random nonce and POSTs it here. The shard
+// signs a payload binding the nonce, protocol version, and its own public key
+// (discoverable from the Router-signed routing table — creating the two-stage
+// trust chain: Router verifies routing table → routing table contains shard
+// pubkey → shard proves possession of the corresponding private key here).
+// Prevents relay impersonation: only the shard holding the private key
+// matching the routing table entry can produce a valid signature.
+async function handleServerHello(request, env) {
+  let body
+  try { body = await request.json() } catch { return err("Request body must be valid JSON") }
+  const { nonce, protocol = "nextalk/v1" } = body || {}
+  if (!nonce || typeof nonce !== "string" || nonce.length < 8 || nonce.length > 256) {
+    return err("nonce must be a non-empty string (8–256 chars)", 400)
+  }
+  if (typeof protocol !== "string" || protocol.length > 32) {
+    return err("protocol must be a short identifier string", 400)
+  }
+  const identity = await ensureShardIdentity(env)
+  const timestamp = String(Date.now())
+  // Signed payload binds: protocol, client nonce, server public key, timestamp.
+  const signedPayload = `NexTalk Server Authentication:${protocol}:${nonce}:${identity.publicKeyHex}:${timestamp}`
+  const privKey = await importShardPrivateKey(identity.privateKeyPkcs8Base64)
+  const signature = await signWithShardKey(privKey, signedPayload)
+  return json({
+    version: 1,
+    type: "server_hello",
+    protocol,
+    server_public_key: identity.publicKeyHex,
+    challenge: nonce,
+    timestamp,
+    signature,
+  })
+}
+
 // ─── Main fetch handler ───────────────────────────────────────────────────────
 
 export default {
@@ -931,6 +967,7 @@ export default {
 
     try {
       if (url.pathname === "/health" && request.method === "GET") return await handleHealth(request, env)
+      if (url.pathname === "/server_hello" && request.method === "POST") return await handleServerHello(request, env)
       if (url.pathname === "/create" && request.method === "POST") return await handleCreate(request, env, cfg)
       if (url.pathname === "/exists" && request.method === "GET") return await handleExists(request, env)
       if (url.pathname === "/send" && request.method === "POST") return await handleSend(request, env, cfg, ctx)

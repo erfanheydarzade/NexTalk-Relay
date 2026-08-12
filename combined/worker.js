@@ -930,6 +930,39 @@ async function handleAdminShardInfo(request, env) {
   return json({ shard_pubkey: identity.publicKeyHex, router_url: env.ROUTER_URL || null, self_url: env.SELF_URL || null })
 }
 
+// ─── POST /server_hello — prove server identity to a connecting client ─────────
+//
+// In Router mode the Router's key is used (discoverable via routing_table.json
+// router_public_key). In shard-only mode the shard's self-generated identity
+// key is used (discoverable via the routing table's shards[].pubkey entry).
+async function handleServerHello(request, env) {
+  let body
+  try { body = await request.json() } catch { return err("Request body must be valid JSON") }
+  const { nonce, protocol = "nextalk/v1" } = body || {}
+  if (!nonce || typeof nonce !== "string" || nonce.length < 8 || nonce.length > 256) {
+    return err("nonce must be a non-empty string (8–256 chars)", 400)
+  }
+  if (typeof protocol !== "string" || protocol.length > 32) {
+    return err("protocol must be a short identifier string", 400)
+  }
+  const timestamp = String(Date.now())
+
+  if (env.ROUTER_SIGNING_KEY && env.ROUTER_SIGNING_PUBLIC) {
+    // Router mode: sign with the stable Router key (trust anchor for all clients).
+    const signedPayload = `NexTalk Server Authentication:${protocol}:${nonce}:${env.ROUTER_SIGNING_PUBLIC}:${timestamp}`
+    const signingKey = await importSigningKey(env.ROUTER_SIGNING_KEY)
+    const signature = await signHex(signingKey, signedPayload)
+    return json({ version: 1, type: "server_hello", protocol, server_public_key: env.ROUTER_SIGNING_PUBLIC, challenge: nonce, timestamp, signature })
+  }
+
+  // Shard-only mode: sign with the shard's self-generated identity key.
+  const identity = await ensureShardIdentity(env)
+  const signedPayload = `NexTalk Server Authentication:${protocol}:${nonce}:${identity.publicKeyHex}:${timestamp}`
+  const privKey = await importShardPrivateKey(identity.privateKeyPkcs8Base64)
+  const signature = await signWithShardKey(privKey, signedPayload)
+  return json({ version: 1, type: "server_hello", protocol, server_public_key: identity.publicKeyHex, challenge: nonce, timestamp, signature })
+}
+
 async function handleAdminRegister(request, env) {
   if (env.ROUTER_SHARED_SECRET) {
     const authHeader = request.headers.get("Authorization") || ""
@@ -1026,6 +1059,7 @@ export default {
 
     try {
       if (url.pathname === "/health" && request.method === "GET") return await handleHealth(request, env)
+      if (url.pathname === "/server_hello" && request.method === "POST") return await handleServerHello(request, env)
       if (url.pathname === "/create" && request.method === "POST") return await handleCreate(request, env, cfg)
       if (url.pathname === "/exists" && request.method === "GET") return await handleExists(request, env)
       if (url.pathname === "/send" && request.method === "POST") return await handleSend(request, env, cfg, ctx)
