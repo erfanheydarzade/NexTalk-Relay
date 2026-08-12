@@ -1,0 +1,187 @@
+name: Release
+
+# Push a button instead of tagging-and-waiting: run this from the Actions
+# tab (Run workflow) and choose a version. It tags that version and publishes
+# a GitHub Release with an auto-generated, grouped changelog built from
+# Conventional Commit messages. There are no build artifacts — the Workers
+# are deployed directly from source via `wrangler deploy`, so the release is
+# purely the source tag + release notes.
+#
+# Re-running this workflow for a version that's already released is safe:
+# the "Tag release" step is a no-op if the tag already exists, and the
+# release action updates the existing release's notes rather than failing.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Version to release, e.g. v1.4.0 (must start with "v" and follow
+          semver). Leave the "prerelease" box checked for a beta/rc build.
+        required: true
+        type: string
+      prerelease:
+        description: "Mark this as a pre-release (not shown as 'latest')"
+        required: false
+        type: boolean
+        default: false
+  # Also supports the traditional `git tag vX.Y.Z && git push --tags` flow
+  # for anyone who prefers that over the manual button.
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    name: Tag release
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Validate version input
+        id: resolve
+        run: |
+          version="${{ inputs.version }}"
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$version' is not a valid semver tag (expected e.g. v1.4.0 or v1.4.0-rc.1)"
+            exit 1
+          fi
+          echo "tag=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create and push tag (no-op if it already exists)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          tag="${{ steps.resolve.outputs.tag }}"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists, reusing it."
+          else
+            git tag -a "$tag" -m "Release $tag"
+            git push origin "$tag"
+          fi
+
+  release:
+    name: Publish release
+    needs: [tag]
+    if: always() && !failure() && !cancelled()
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ needs.tag.outputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Syntax check — shard
+        run: node --check shard/worker.js
+
+      - name: Syntax check — router
+        run: node --check router/router.js
+
+      - name: Syntax check — combined
+        run: node --check combined/worker.js
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${RELEASE_TAG}$" | head -1)
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="HEAD"
+            COMPARE_LINE=""
+          else
+            RANGE="${PREV_TAG}..HEAD"
+            COMPARE_LINE="**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${RELEASE_TAG}"
+          fi
+
+          pick_commits() {
+            local pattern="$1"
+            git log "$RANGE" --pretty=format:"- %s" \
+              --grep="$pattern" \
+              --perl-regexp \
+              --no-merges \
+              --invert-grep --grep="^Merge pull request" \
+              --invert-grep --grep="^Merge branch" \
+              --invert-grep --grep="^ci:" \
+              --invert-grep --grep="^chore\(deps\):" \
+              2>/dev/null | grep -P "$pattern" || true
+          }
+
+          FEATURES=$(git log "$RANGE" --pretty=format:"- %s" --no-merges 2>/dev/null \
+            | grep -P '^- feat(\([^)]+\))?!?:' || true)
+          FIXES=$(git log "$RANGE" --pretty=format:"- %s" --no-merges 2>/dev/null \
+            | grep -P '^- fix(\([^)]+\))?!?:' || true)
+          DOCS=$(git log "$RANGE" --pretty=format:"- %s" --no-merges 2>/dev/null \
+            | grep -P '^- docs(\([^)]+\))?!?:' || true)
+          BUILD=$(git log "$RANGE" --pretty=format:"- %s" --no-merges 2>/dev/null \
+            | grep -P '^- (build|perf|refactor)(\([^)]+\))?!?:' || true)
+          OTHER=$(git log "$RANGE" --pretty=format:"- %s" --no-merges 2>/dev/null \
+            | grep -vP '^- (feat|fix|docs|build|perf|refactor|ci|chore|test)(\([^)]+\))?!?:' \
+            | grep -vP '^- Merge' || true)
+
+          BODY=""
+          if [ -n "$FEATURES" ]; then
+            BODY="${BODY}### Features\n\n${FEATURES}\n\n"
+          fi
+          if [ -n "$FIXES" ]; then
+            BODY="${BODY}### Fixes\n\n${FIXES}\n\n"
+          fi
+          if [ -n "$DOCS" ]; then
+            BODY="${BODY}### Documentation\n\n${DOCS}\n\n"
+          fi
+          if [ -n "$BUILD" ]; then
+            BODY="${BODY}### Build & tooling\n\n${BUILD}\n\n"
+          fi
+          if [ -n "$OTHER" ]; then
+            BODY="${BODY}### Other\n\n${OTHER}\n\n"
+          fi
+          if [ -z "$BODY" ]; then
+            BODY="No user-facing changes in this release.\n\n"
+          fi
+
+          HEADER="## NexTalk-Relay ${RELEASE_TAG}\n\nAnonymous, burn-after-read mailbox relay for [NexTalk](https://github.com/erfanheydarzade/NexTalk) — deployed as Cloudflare Workers, no binary artifacts required.\n\n### Deploying\n\nSee the [README](https://github.com/${{ github.repository }}/blob/${RELEASE_TAG}/README.md) for full setup instructions.\n\n"
+
+          FULL="${HEADER}${BODY}"
+          if [ -n "$COMPARE_LINE" ]; then
+            FULL="${FULL}---\n${COMPARE_LINE}"
+          fi
+
+          # Write to a file to safely pass multi-line content
+          printf "%b" "$FULL" > /tmp/release_notes.md
+          echo "prev_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${RELEASE_TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" \
+              --repo "${{ github.repository }}" \
+              --notes-file /tmp/release_notes.md \
+              --title "NexTalk-Relay ${RELEASE_TAG}"
+          else
+            gh release create "${RELEASE_TAG}" \
+              --repo "${{ github.repository }}" \
+              --notes-file /tmp/release_notes.md \
+              --title "NexTalk-Relay ${RELEASE_TAG}"
+          fi
+
+      - name: Mark pre-release if requested
+        if: github.event_name == 'workflow_dispatch' && inputs.prerelease
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${RELEASE_TAG}" --repo "${{ github.repository }}" --prerelease

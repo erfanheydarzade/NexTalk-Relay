@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same branch/PR to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Syntax & Dry-Run Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Syntax check — shard/worker.js
+        run: node --check shard/worker.js
+
+      - name: Syntax check — router/router.js
+        run: node --check router/router.js
+
+      - name: Syntax check — combined/worker.js
+        run: node --check combined/worker.js
+
+      - name: Install Wrangler
+        run: npm install -g wrangler
+
+      - name: Dry-run deploy check (shard)
+        run: |
+          cp shard/wrangler.toml.example shard/wrangler.toml
+          cd shard && wrangler deploy --dry-run --outdir /tmp/shard-build
+
+      - name: Dry-run deploy check (router)
+        run: |
+          cp router/wrangler.toml.example router/wrangler.toml
+          cd router && wrangler deploy --dry-run --outdir /tmp/router-build
+
+      - name: Dry-run deploy check (combined)
+        run: |
+          cp combined/wrangler.toml.example combined/wrangler.toml
+          cd combined && wrangler deploy --dry-run --outdir /tmp/combined-build
