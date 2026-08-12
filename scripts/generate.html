@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Router Secrets Generator</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --surface-color: #1e293b;
+            --text-color: #e2e8f0;
+            --primary-color: #3b82f6;
+            --primary-hover: #2563eb;
+            --code-bg: #000000;
+            --accent: #10b981;
+            --border: #334155;
+        }
+
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 2rem;
+            display: flex;
+            justify-content: center;
+        }
+
+        .container {
+            max-width: 800px;
+            width: 100%;
+            background-color: var(--surface-color);
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+
+        h1 {
+            margin-top: 0;
+            font-size: 1.5rem;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 1rem;
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+
+        button {
+            background-color: var(--primary-color);
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 6px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+        button:hover {
+            background-color: var(--primary-hover);
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        #btn-download {
+            background-color: var(--accent);
+        }
+
+        #btn-download:hover {
+            background-color: #059669;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .tab {
+            background-color: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-color);
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+
+        .tab.active {
+            background-color: var(--border);
+        }
+
+        .output-container {
+            position: relative;
+        }
+
+        pre {
+            background-color: var(--code-bg);
+            padding: 1.5rem;
+            border-radius: 8px;
+            overflow-x: auto;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 0.9rem;
+            line-height: 1.5;
+            border: 1px solid var(--border);
+            margin: 0;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .error {
+            color: #ef4444;
+            background: #451a1a;
+            padding: 1rem;
+            border-radius: 6px;
+            margin-bottom: 1rem;
+            border: 1px solid #7f1d1d;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>Router Secrets Generator</h1>
+    
+    <div id="error-box" class="error hidden"></div>
+
+    <div class="btn-group">
+        <button id="btn-generate">Generate Secrets</button>
+        <button id="btn-download" class="hidden">Download .dev.vars</button>
+    </div>
+
+    <div id="output-section" class="hidden">
+        <div class="tabs">
+            <button class="tab active" data-target="out-human">Human Readable</button>
+            <button class="tab" data-target="out-devvars">.dev.vars</button>
+            <button class="tab" data-target="out-json">JSON</button>
+        </div>
+
+        <div class="output-container">
+            <pre id="out-human"></pre>
+            <pre id="out-devvars" class="hidden"></pre>
+            <pre id="out-json" class="hidden"></pre>
+        </div>
+    </div>
+</div>
+
+<script>
+    // --- Cryptography Utilities ---
+
+    function buf2hex(buffer) {
+        return [...new Uint8Array(buffer)]
+            .map(x => x.toString(16).padStart(2, '0'))
+            .join('');
+    }
+
+    function buf2base64(buffer) {
+        let binary = '';
+        const bytes = new Uint8Array(buffer);
+        for (let i = 0; i < bytes.byteLength; i++) {
+            binary += String.fromCharCode(bytes[i]);
+        }
+        return btoa(binary);
+    }
+
+    function generateHexSecret(numBytes = 32) {
+        const arr = new Uint8Array(numBytes);
+        crypto.getRandomValues(arr);
+        return buf2hex(arr);
+    }
+
+    async function generateAll() {
+        if (!crypto.subtle) {
+            throw new Error("Web Crypto API (crypto.subtle) is not available. Please ensure you are running this over HTTPS or localhost.");
+        }
+
+        const serverSecret = generateHexSecret(32);
+        const routerSharedSecret = generateHexSecret(32);
+
+        // Generate Ed25519 Keypair
+        let keypair;
+        try {
+            keypair = await crypto.subtle.generateKey(
+                { name: "Ed25519" },
+                true,
+                ["sign", "verify"]
+            );
+        } catch (err) {
+            throw new Error("Your browser does not support Ed25519 in the Web Crypto API. Please use a recent version of Chrome (113+), Firefox (119+), or Safari (17+).");
+        }
+
+        // Export Private Key as PKCS8 -> Base64
+        const privatePkcs8Der = await crypto.subtle.exportKey(
+            "pkcs8",
+            keypair.privateKey
+        );
+        const routerSigningKey = buf2base64(privatePkcs8Der);
+
+        // Export Public Key as Raw -> Hex
+        const publicRaw = await crypto.subtle.exportKey(
+            "raw",
+            keypair.publicKey
+        );
+        const routerSigningPublic = buf2hex(publicRaw);
+
+        return {
+            SERVER_SECRET: serverSecret,
+            ROUTER_SHARED_SECRET: routerSharedSecret,
+            ROUTER_SIGNING_KEY: routerSigningKey,
+            ROUTER_SIGNING_PUBLIC: routerSigningPublic
+        };
+    }
+
+    // --- Output Formatters ---
+
+    function formatHuman(values) {
+        return `==============================================================================
+  Router secrets — generated fresh, never reuse across environments
+==============================================================================
+
+SECRETS (set these with \`wrangler secret put <NAME>\`, never commit):
+
+  SERVER_SECRET
+    ${values.SERVER_SECRET}
+
+  ROUTER_SIGNING_KEY
+    ${values.ROUTER_SIGNING_KEY}
+
+  ROUTER_SHARED_SECRET
+    ${values.ROUTER_SHARED_SECRET}
+
+------------------------------------------------------------------------------
+PUBLIC VALUE (safe to commit to wrangler.toml [vars], and to hand to
+shard operators so their worker.js can verify your signatures):
+
+  ROUTER_SIGNING_PUBLIC
+    ${values.ROUTER_SIGNING_PUBLIC}
+
+------------------------------------------------------------------------------
+Quick setup:
+
+  echo -n '${values.SERVER_SECRET}' | wrangler secret put SERVER_SECRET
+  echo -n '${values.ROUTER_SIGNING_KEY}' | wrangler secret put ROUTER_SIGNING_KEY
+  echo -n '${values.ROUTER_SHARED_SECRET}' | wrangler secret put ROUTER_SHARED_SECRET
+
+  # then in wrangler.toml [vars]:
+  ROUTER_SIGNING_PUBLIC = "${values.ROUTER_SIGNING_PUBLIC}"
+`;
+    }
+
+    function formatDevVars(values) {
+        return `# Generated via Web Crypto API — local \`wrangler dev\` only, NEVER commit this file.
+SERVER_SECRET="${values.SERVER_SECRET}"
+ROUTER_SHARED_SECRET="${values.ROUTER_SHARED_SECRET}"
+ROUTER_SIGNING_KEY="${values.ROUTER_SIGNING_KEY}"
+ROUTER_SIGNING_PUBLIC="${values.ROUTER_SIGNING_PUBLIC}"
+PRIOR_SHARD_COUNTS='[]'
+ROUTING_TABLE_VERSION=1
+SHARD_URLS='[]'
+REPLICATION_FACTOR=1
+SHARD_POW_DIFFICULTY_BITS=8
+MAX_REGISTERED_SHARDS=200
+`;
+    }
+
+    // --- UI Interaction ---
+
+    const btnGenerate = document.getElementById('btn-generate');
+    const btnDownload = document.getElementById('btn-download');
+    const errorBox = document.getElementById('error-box');
+    const outputSection = document.getElementById('output-section');
+    
+    const outHuman = document.getElementById('out-human');
+    const outDevVars = document.getElementById('out-devvars');
+    const outJson = document.getElementById('out-json');
+    const tabs = document.querySelectorAll('.tab');
+
+    let currentDevVarsContent = '';
+
+    btnGenerate.addEventListener('click', async () => {
+        try {
+            errorBox.classList.add('hidden');
+            btnGenerate.disabled = true;
+            btnGenerate.textContent = 'Generating...';
+
+            const values = await generateAll();
+
+            // Populate text areas
+            outHuman.textContent = formatHuman(values);
+            currentDevVarsContent = formatDevVars(values);
+            outDevVars.textContent = currentDevVarsContent;
+            outJson.textContent = JSON.stringify(values, null, 2);
+
+            outputSection.classList.remove('hidden');
+            btnDownload.classList.remove('hidden');
+
+        } catch (err) {
+            errorBox.textContent = err.message;
+            errorBox.classList.remove('hidden');
+        } finally {
+            btnGenerate.disabled = false;
+            btnGenerate.textContent = 'Generate Secrets';
+        }
+    });
+
+    btnDownload.addEventListener('click', () => {
+        if (!currentDevVarsContent) return;
+        const blob = new Blob([currentDevVarsContent], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = '.dev.vars';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    });
+
+    tabs.forEach(tab => {
+        tab.addEventListener('click', (e) => {
+            tabs.forEach(t => t.classList.remove('active'));
+            e.target.classList.add('active');
+
+            outHuman.classList.add('hidden');
+            outDevVars.classList.add('hidden');
+            outJson.classList.add('hidden');
+
+            const targetId = e.target.getAttribute('data-target');
+            document.getElementById(targetId).classList.remove('hidden');
+        });
+    });
+
+</script>
+</body>
+</html>
