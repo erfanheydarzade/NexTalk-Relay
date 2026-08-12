@@ -1,0 +1,17 @@
+# Copy this file to .dev.vars for local `wrangler dev` testing.
+# Generate real values with router/generate.html or router/generate.py — never commit real secrets.
+SERVER_SECRET="replace-with-generated-hex-secret"
+ROUTER_SHARED_SECRET="replace-with-generated-hex-secret"
+ROUTER_SIGNING_KEY="replace-with-base64-pkcs8-ed25519-private-key"
+ROUTER_SIGNING_PUBLIC="replace-with-hex-ed25519-public-key"
+PRIOR_SHARD_COUNTS='[]'
+ROUTING_TABLE_VERSION=1
+
+SHARD_URLS='["http://127.0.0.1:8788"]'
+
+# v2.2: replication + self-registration (router side)
+REPLICATION_FACTOR=1
+SHARD_POW_DIFFICULTY_BITS=8
+MAX_REGISTERED_SHARDS=200
+# ROUTER_ADMIN_KV must still be bound via [[kv_namespaces]] even locally —
+# `wrangler dev` will use a local KV emulation automatically.

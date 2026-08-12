@@ -1,0 +1,11 @@
+name = "nextalk-router"
+main = "router.js"
+compatibility_date = "2026-06-10"
+
+# Periodically pushes the signed routing table out to every shard so
+# clients can fetch it from a shard instead of the Router. Keep this well
+# under ROUTING_TABLE_TTL_SECONDS (3600s) — every 5 minutes is plenty.
+# You can also trigger a push immediately via POST /admin/push_routing_table
+# right after changing SHARD_URLS / ROUTING_TABLE_VERSION.
+[triggers]
+crons = ["*/5 * * * *"]
