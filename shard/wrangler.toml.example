@@ -1,0 +1,54 @@
+name = "nextalk-relay-shard"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# One KV namespace per shard. Create with:
+#   wrangler kv namespace create MAILBOX_KV
+[[kv_namespaces]]
+binding = "MAILBOX_KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# Required var: ROUTER_SIGNING_PUBLIC (hex, 32-byte Ed25519 public key) —
+# PUBLIC data, safe to hardcode/commit. This is the Router operator's public
+# key; get it from them (or from the Router's own wrangler.toml if you run
+# both). No secret-sharing with the Router is required for this.
+#
+# This shard has no other required secrets — see worker.js header comment.
+# ROUTER_SHARED_SECRET below is optional (only gates /health).
+#
+# wrangler secret put ROUTER_SHARED_SECRET   # optional
+
+[vars]
+ROUTER_SIGNING_PUBLIC = "REPLACE_WITH_ROUTER_OPERATORS_ED25519_PUBLIC_KEY_HEX"
+
+# Tunable limits — all optional, defaults are shown here.
+MAX_MESSAGES = "50"
+MAX_MSG_BYTES = "32768"
+TTL_SECONDS = "1209600"           # 14 days  — unread MESSAGE backlog TTL
+MAILBOX_TTL_SECONDS = "31536000"  # 365 days — whole MAILBOX record TTL, sliding
+                                   # (renewed on every /create, /send, /read)
+MAX_CLOCK_SKEW = "30000"          # 30 seconds
+MAX_SENDS_PER_SENDER = "30"
+MAX_SENDS_PER_TARGET = "60"
+MAX_SENDS_PER_IP = "120"
+MAX_CREATES_PER_IP = "20"
+MAX_REPLICATES_PER_ORIGIN = "200" # per-origin-shard rate limit on /internal/replicate
+
+# ─── Self-registration (recommended) ────────────────────────────────────
+# Set both to have this shard introduce itself to the Router automatically
+# (PoW-gated — see router.js) instead of the operator hand-editing the
+# Router's SHARD_URLS. Omit both to run in a fully static/manual mesh, or
+# alongside a router that has no ROUTER_ADMIN_KV bound.
+# ROUTER_URL must be the Router's own public base URL (no trailing slash).
+# SELF_URL must be THIS shard's own public URL, exactly as reachable by
+# other shards and the Router (used both as the registration identity and
+# as the "is this me?" check when fanning out replication).
+ROUTER_URL = "https://your-router.example.workers.dev"
+SELF_URL = "https://shard-a.example.workers.dev"
+
+# Optional — re-asserts self-registration even if this shard gets no
+# traffic for a while (registration is otherwise attempted opportunistically
+# on every request, throttled to ~2x/day per SELF_REGISTER_MIN_INTERVAL_MS
+# in worker.js). Not required, but recommended for low-traffic shards.
+# [triggers]
+# crons = ["0 */6 * * *"]
