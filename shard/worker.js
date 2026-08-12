@@ -969,7 +969,93 @@ async function handleServerHello(request, env) {
   })
 }
 
-// ─── Main fetch handler ───────────────────────────────────────────────────────
+// ─── POST /admin/rotate_key — rotate this shard's identity key ───────────────
+//
+// Generates a new Ed25519 keypair locally, signs a key-rotation record with
+// the OLD private key (authorizing the migration) and a self-ownership proof
+// with the NEW private key, then notifies the Router via POST /rotate_shard_key.
+// The private key never leaves this worker — only the public halves travel.
+// After rotation the old key is retired from KV; subsequent /server_hello
+// calls use the new key, and the routing table will reflect it after the
+// Router's next scheduled push.
+async function handleAdminRotateKey(request, env) {
+  if (env.ROUTER_SHARED_SECRET) {
+    const authHeader = request.headers.get("Authorization") || ""
+    const match = authHeader.match(/^Bearer\s+(.+)$/i)
+    if (!match || !constantTimeEqual(match[1], env.ROUTER_SHARED_SECRET)) {
+      return err("Unauthorized", 401)
+    }
+  }
+  if (!env.SELF_URL) return err("SELF_URL is not configured on this shard", 500)
+
+  const identity = await ensureShardIdentity(env)
+  const oldPrivKey = await importShardPrivateKey(identity.privateKeyPkcs8Base64)
+
+  // Generate a new identity keypair — extractable so we can persist the private half.
+  const newKeyPair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"])
+  const newPubBytes = new Uint8Array(await crypto.subtle.exportKey("raw", newKeyPair.publicKey))
+  const newPrivBytes = new Uint8Array(await crypto.subtle.exportKey("pkcs8", newKeyPair.privateKey))
+  const newPubHex = bytesToHex(newPubBytes)
+  const newPrivBase64 = btoa(String.fromCharCode(...newPrivBytes))
+
+  const timestamp = String(Date.now())
+
+  // Old key signs the migration — proves the current identity holder authorized it.
+  const migrationMsg = `key_rotation:${env.SELF_URL}:${identity.publicKeyHex}:${newPubHex}:${timestamp}`
+  const oldSig = await signWithShardKey(oldPrivKey, migrationMsg)
+
+  // New key proves self-ownership — prevents rotating to a key the caller doesn't hold.
+  const acceptMsg = `key_rotation_accept:${env.SELF_URL}:${identity.publicKeyHex}:${newPubHex}:${timestamp}`
+  const newSig = await signWithShardKey(newKeyPair.privateKey, acceptMsg)
+
+  // Persist new identity to KV before contacting the Router so a network
+  // failure doesn't leave this shard with a key the Router hasn't seen yet
+  // but also hasn't retired from its records. The Router call is best-effort.
+  const newIdentity = { publicKeyHex: newPubHex, privateKeyPkcs8Base64: newPrivBase64 }
+  await env.MAILBOX_KV.put(SHARD_IDENTITY_KV_KEY, JSON.stringify(newIdentity))
+  // Reset self-registration so ensureSelfRegistered() re-registers with
+  // the new key on the next request or cron tick.
+  await env.MAILBOX_KV.delete(SELF_REGISTER_KV_KEY)
+
+  const result = {
+    rotated: true,
+    old_pubkey: identity.publicKeyHex,
+    new_pubkey: newPubHex,
+    router_notified: false,
+    router_response: null,
+  }
+
+  const targetRouter = (env.ROUTER_URL || "").replace(/\/$/, "")
+  if (targetRouter) {
+    try {
+      const regResp = await fetch(`${targetRouter}/rotate_shard_key`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          shard_url: env.SELF_URL,
+          old_pubkey: identity.publicKeyHex,
+          new_pubkey: newPubHex,
+          timestamp,
+          old_signature: oldSig,
+          new_signature: newSig,
+        }),
+        signal: AbortSignal.timeout(10_000),
+      })
+      const routerResult = await regResp.json().catch(() => ({}))
+      result.router_notified = regResp.ok
+      result.router_response = routerResult
+      if (!regResp.ok) {
+        result.router_error = `Router returned ${regResp.status}`
+      }
+    } catch (e) {
+      result.router_error = String(e)
+    }
+  }
+
+  return json(result)
+}
+
+// ─── Main fetch handler ────────────────────────────────────────────────
 
 export default {
   // Optional cron entry point (see wrangler.toml [triggers] crons). Not
@@ -1022,8 +1108,9 @@ export default {
       if (url.pathname === "/internal/routing_table" && request.method === "POST") return await handleRoutingTablePush(request, env)
       if (url.pathname === "/internal/replicate" && request.method === "POST") return await handleReplicate(request, env, cfg)
       if (url.pathname === "/routing_table.json" && request.method === "GET") return await handleRoutingTableServe(env)
-      if (url.pathname === "/admin/shard_info" && request.method === "GET")  return await handleAdminShardInfo(request, env)
-      if (url.pathname === "/admin/register"   && request.method === "POST") return await handleAdminRegister(request, env)
+      if (url.pathname === "/admin/shard_info"  && request.method === "GET")  return await handleAdminShardInfo(request, env)
+      if (url.pathname === "/admin/register"    && request.method === "POST") return await handleAdminRegister(request, env)
+      if (url.pathname === "/admin/rotate_key"  && request.method === "POST") return await handleAdminRotateKey(request, env)
     } catch (e) {
       console.error("Unhandled error:", e)
       return err("Internal server error", 500)

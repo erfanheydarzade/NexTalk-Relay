@@ -1042,6 +1042,105 @@ async function handleServerHello(request, env) {
   return json({ version: 1, type: "server_hello", protocol, server_public_key: identity.publicKeyHex, challenge: nonce, timestamp, signature })
 }
 
+// ─── POST /rotate_shard_key — authorized shard identity key rotation ──────────
+//
+// old_signature: Sign(old_privkey, "key_rotation:{shard_url}:{old_pubkey}:{new_pubkey}:{timestamp}")
+// new_signature: Sign(new_privkey, "key_rotation_accept:{shard_url}:{old_pubkey}:{new_pubkey}:{timestamp}")
+async function handleRotateShardKey(request, env) {
+  if (!env.ROUTER_ADMIN_KV) return err("shard key rotation requires ROUTER_ADMIN_KV", 501)
+
+  let body
+  try { body = await request.json() } catch { return err("Request body must be valid JSON", 400) }
+
+  const { shard_url: shardUrl, old_pubkey: oldPubkey, new_pubkey: newPubkey, timestamp, old_signature: oldSig, new_signature: newSig } = body || {}
+
+  if (!shardUrl || typeof shardUrl !== "string" || !/^https?:\/\/\S+$/i.test(shardUrl)) return err("shard_url must be a valid http(s) URL", 400)
+  if (!oldPubkey || !/^[0-9a-f]{64}$/i.test(oldPubkey)) return err("old_pubkey must be 64-char hex", 400)
+  if (!newPubkey || !/^[0-9a-f]{64}$/i.test(newPubkey)) return err("new_pubkey must be 64-char hex", 400)
+  if (oldPubkey.toLowerCase() === newPubkey.toLowerCase()) return err("new_pubkey must differ from old_pubkey", 400)
+  if (!timestamp || !/^\d+$/.test(timestamp)) return err("timestamp required", 400)
+  if (!oldSig || !/^[0-9a-f]{128}$/i.test(oldSig)) return err("old_signature must be 128-char hex", 400)
+  if (!newSig || !/^[0-9a-f]{128}$/i.test(newSig)) return err("new_signature must be 128-char hex", 400)
+  if (Math.abs(Date.now() - Number(timestamp)) > 60_000) return err("timestamp outside allowed skew", 401)
+
+  const existing = await getRegisteredShards(env)
+  const record = existing.find(s => s.url === shardUrl)
+  if (!record) return err("shard not found in registered shards", 404)
+  if (record.pubkey.toLowerCase() !== oldPubkey.toLowerCase()) return err("old_pubkey does not match current shard identity", 401)
+
+  const migrationMsg = `key_rotation:${shardUrl}:${oldPubkey.toLowerCase()}:${newPubkey.toLowerCase()}:${timestamp}`
+  if (!await verifyEd25519(oldPubkey, migrationMsg, oldSig)) return err("old key signature verification failed", 401)
+
+  const acceptMsg = `key_rotation_accept:${shardUrl}:${oldPubkey.toLowerCase()}:${newPubkey.toLowerCase()}:${timestamp}`
+  if (!await verifyEd25519(newPubkey, acceptMsg, newSig)) return err("new key self-signature verification failed", 401)
+
+  const updated = existing.map(s =>
+    s.url === shardUrl
+      ? { url: shardUrl, pubkey: newPubkey.toLowerCase(), registered_at: s.registered_at, updated_at: Date.now(), previous_pubkey: oldPubkey.toLowerCase() }
+      : s,
+  )
+  await env.ROUTER_ADMIN_KV.put("registered_shards", JSON.stringify(updated))
+
+  const currentVersion = await getRoutingTableVersion(env)
+  await env.ROUTER_ADMIN_KV.put("routing_table_version", String(currentVersion + 1))
+
+  return jsonOk({ rotated: true, shard_url: shardUrl, new_pubkey: newPubkey.toLowerCase(), table_version: currentVersion + 1 })
+}
+
+// ─── POST /admin/rotate_key — rotate this node's shard identity key ───────────
+//
+// Generates a new Ed25519 keypair locally, constructs a dual-signature key-
+// rotation record, persists the new identity to KV, and notifies the Router.
+// The private key never leaves this worker.
+async function handleAdminRotateKey(request, env) {
+  if (env.ROUTER_SHARED_SECRET) {
+    const authHeader = request.headers.get("Authorization") || ""
+    const match = authHeader.match(/^Bearer\s+(.+)$/i)
+    if (!match || !constantTimeEqual(match[1], env.ROUTER_SHARED_SECRET)) return err("Unauthorized", 401)
+  }
+  if (!env.SELF_URL) return err("SELF_URL is not configured on this node", 500)
+
+  const identity = await ensureShardIdentity(env)
+  const oldPrivKey = await importShardPrivateKey(identity.privateKeyPkcs8Base64)
+
+  const newKeyPair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"])
+  const newPubBytes = new Uint8Array(await crypto.subtle.exportKey("raw", newKeyPair.publicKey))
+  const newPrivBytes = new Uint8Array(await crypto.subtle.exportKey("pkcs8", newKeyPair.privateKey))
+  const newPubHex = bytesToHex(newPubBytes)
+  const newPrivBase64 = btoa(String.fromCharCode(...newPrivBytes))
+
+  const timestamp = String(Date.now())
+  const migrationMsg = `key_rotation:${env.SELF_URL}:${identity.publicKeyHex}:${newPubHex}:${timestamp}`
+  const oldSig = await signWithShardKey(oldPrivKey, migrationMsg)
+  const acceptMsg = `key_rotation_accept:${env.SELF_URL}:${identity.publicKeyHex}:${newPubHex}:${timestamp}`
+  const newSig = await signWithShardKey(newKeyPair.privateKey, acceptMsg)
+
+  await env.MAILBOX_KV.put(SHARD_IDENTITY_KV_KEY, JSON.stringify({ publicKeyHex: newPubHex, privateKeyPkcs8Base64: newPrivBase64 }))
+  await env.MAILBOX_KV.delete(SELF_REGISTER_KV_KEY)
+
+  const result = { rotated: true, old_pubkey: identity.publicKeyHex, new_pubkey: newPubHex, router_notified: false, router_response: null }
+
+  const targetRouter = (env.ROUTER_URL || "").replace(/\/$/, "")
+  if (targetRouter && targetRouter !== env.SELF_URL) {
+    try {
+      const regResp = await fetch(`${targetRouter}/rotate_shard_key`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ shard_url: env.SELF_URL, old_pubkey: identity.publicKeyHex, new_pubkey: newPubHex, timestamp, old_signature: oldSig, new_signature: newSig }),
+        signal: AbortSignal.timeout(10_000),
+      })
+      const routerResult = await regResp.json().catch(() => ({}))
+      result.router_notified = regResp.ok
+      result.router_response = routerResult
+      if (!regResp.ok) result.router_error = `Router returned ${regResp.status}`
+    } catch (e) {
+      result.router_error = String(e)
+    }
+  }
+
+  return json(result)
+}
+
 async function handleAdminRegister(request, env) {
   if (env.ROUTER_SHARED_SECRET) {
     const authHeader = request.headers.get("Authorization") || ""
@@ -1145,8 +1244,9 @@ export default {
       if (url.pathname === "/read" && request.method === "GET") return await handleRead(request, env, cfg)
       if (url.pathname === "/internal/routing_table" && request.method === "POST") return await handleRoutingTablePush(request, env)
       if (url.pathname === "/internal/replicate" && request.method === "POST") return await handleReplicate(request, env, cfg)
-      if (url.pathname === "/admin/shard_info" && request.method === "GET") return await handleAdminShardInfo(request, env)
-      if (url.pathname === "/admin/register" && request.method === "POST") return await handleAdminRegister(request, env)
+      if (url.pathname === "/admin/shard_info"  && request.method === "GET")  return await handleAdminShardInfo(request, env)
+      if (url.pathname === "/admin/register"    && request.method === "POST") return await handleAdminRegister(request, env)
+      if (url.pathname === "/admin/rotate_key"  && request.method === "POST") return await handleAdminRotateKey(request, env)
 
       if (url.pathname === "/routing_table.json" && request.method === "GET") return await handleRoutingTableServe(env)
 
@@ -1165,6 +1265,7 @@ export default {
         if (url.pathname === "/status" && request.method === "GET") return await handleStatus(env, shardUrls)
         if (url.pathname === "/pow_challenge" && request.method === "GET") return await handlePowChallenge(request, env)
         if (url.pathname === "/register_shard" && request.method === "POST") return await handleRegisterShard(request, env)
+        if (url.pathname === "/rotate_shard_key" && request.method === "POST") return await handleRotateShardKey(request, env)
 
         if (url.pathname === "/admin/push_routing_table" && request.method === "POST") {
           if (env.ROUTER_SHARED_SECRET) {

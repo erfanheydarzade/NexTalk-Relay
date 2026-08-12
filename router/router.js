@@ -778,6 +778,89 @@ async function buildSignedResponse(env, requestId, status, body) {
   }
 }
 
+// ─── POST /rotate_shard_key — authorized shard identity key rotation ──────────
+//
+// A registered shard rotates its identity key without losing its place in
+// the mesh. Two signatures are required:
+//   old_signature: Sign(old_privkey, "key_rotation:{shard_url}:{old_pubkey}:{new_pubkey}:{timestamp}")
+//   new_signature: Sign(new_privkey, "key_rotation_accept:{shard_url}:{old_pubkey}:{new_pubkey}:{timestamp}")
+// The old key proves the existing identity holder authorized the rotation.
+// The new key proves the requestor actually holds the new private key.
+// Neither alone is sufficient, preventing unilateral hijacking.
+async function handleRotateShardKey(request, env) {
+  if (!env.ROUTER_ADMIN_KV) {
+    return jsonErr("shard key rotation requires ROUTER_ADMIN_KV", 501)
+  }
+
+  let body
+  try { body = await request.json() } catch { return jsonErr("Request body must be valid JSON", 400) }
+
+  const {
+    shard_url: shardUrl,
+    old_pubkey: oldPubkey,
+    new_pubkey: newPubkey,
+    timestamp,
+    old_signature: oldSig,
+    new_signature: newSig,
+  } = body || {}
+
+  if (!shardUrl || typeof shardUrl !== "string" || !/^https?:\/\/\S+$/i.test(shardUrl)) {
+    return jsonErr("shard_url must be a valid http(s) URL", 400)
+  }
+  if (!oldPubkey || !/^[0-9a-f]{64}$/i.test(oldPubkey)) return jsonErr("old_pubkey must be 64-char hex", 400)
+  if (!newPubkey || !/^[0-9a-f]{64}$/i.test(newPubkey)) return jsonErr("new_pubkey must be 64-char hex", 400)
+  if (oldPubkey.toLowerCase() === newPubkey.toLowerCase()) return jsonErr("new_pubkey must differ from old_pubkey", 400)
+  if (!timestamp || !/^\d+$/.test(timestamp)) return jsonErr("timestamp required", 400)
+  if (!oldSig || !/^[0-9a-f]{128}$/i.test(oldSig)) return jsonErr("old_signature must be 128-char hex", 400)
+  if (!newSig || !/^[0-9a-f]{128}$/i.test(newSig)) return jsonErr("new_signature must be 128-char hex", 400)
+
+  if (Math.abs(Date.now() - Number(timestamp)) > 60_000) return jsonErr("timestamp outside allowed skew", 401)
+
+  const existing = await getRegisteredShards(env)
+  const record = existing.find(s => s.url === shardUrl)
+  if (!record) return jsonErr("shard not found in registered shards", 404)
+  if (record.pubkey.toLowerCase() !== oldPubkey.toLowerCase()) {
+    return jsonErr("old_pubkey does not match current shard identity", 401)
+  }
+
+  // Old key must authorize the migration — proves the current key holder
+  // initiated this, not a third party who simply knows the old pubkey.
+  const migrationMsg = `key_rotation:${shardUrl}:${oldPubkey.toLowerCase()}:${newPubkey.toLowerCase()}:${timestamp}`
+  if (!await verifyEd25519(oldPubkey, migrationMsg, oldSig)) {
+    return jsonErr("old key signature verification failed", 401)
+  }
+
+  // New key must prove self-ownership — prevents rotating to a pubkey the
+  // requestor does not actually control.
+  const acceptMsg = `key_rotation_accept:${shardUrl}:${oldPubkey.toLowerCase()}:${newPubkey.toLowerCase()}:${timestamp}`
+  if (!await verifyEd25519(newPubkey, acceptMsg, newSig)) {
+    return jsonErr("new key self-signature verification failed", 401)
+  }
+
+  const updated = existing.map(s =>
+    s.url === shardUrl
+      ? {
+          url: shardUrl,
+          pubkey: newPubkey.toLowerCase(),
+          registered_at: s.registered_at,
+          updated_at: Date.now(),
+          previous_pubkey: oldPubkey.toLowerCase(),
+        }
+      : s,
+  )
+  await env.ROUTER_ADMIN_KV.put("registered_shards", JSON.stringify(updated))
+
+  const currentVersion = await getRoutingTableVersion(env)
+  await env.ROUTER_ADMIN_KV.put("routing_table_version", String(currentVersion + 1))
+
+  return jsonOk({
+    rotated: true,
+    shard_url: shardUrl,
+    new_pubkey: newPubkey.toLowerCase(),
+    table_version: currentVersion + 1,
+  })
+}
+
 // ─── Main fetch handler ──────────────────────────────────────────────────────
 
 export default {
@@ -847,6 +930,9 @@ export default {
       }
       if (url.pathname === "/register_shard" && request.method === "POST") {
         return await handleRegisterShard(request, env)
+      }
+      if (url.pathname === "/rotate_shard_key" && request.method === "POST") {
+        return await handleRotateShardKey(request, env)
       }
       // Force an immediate push of the current signed routing table to
       // every shard, instead of waiting for the next cron tick. Handy right
