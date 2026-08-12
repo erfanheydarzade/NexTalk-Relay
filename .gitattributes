@@ -1,0 +1,25 @@
+# Normalize line endings on commit so the repo stays consistent
+# regardless of what OS contributors are on.
+* text=auto
+
+# Force LF for JS/Python/shell source so diffs are clean
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.py    text eol=lf
+*.sh    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.html  text eol=lf
+*.json  text eol=lf
+
+# Windows batch files need CRLF
+*.bat   text eol=crlf
+
+# Binaries — no line-ending mangling
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.wasm  binary

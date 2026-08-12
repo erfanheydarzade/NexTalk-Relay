@@ -1,0 +1,106 @@
+# ─── Secrets & local config ──────────────────────────────────────────────────
+# Never commit real credentials or local overrides.
+.dev.vars
+*.dev.vars
+!*.dev.vars.example
+
+wrangler.toml
+!wrangler.toml.example
+
+router-admin.config.bat
+router-admin.config.sh
+
+*.der
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+
+# ─── Wrangler / Cloudflare Workers ───────────────────────────────────────────
+.wrangler/
+dist/
+worker-configuration.d.ts
+
+# ─── Node ────────────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+.pnpm-debug.log*
+.npmrc
+!.npmrc.example
+
+# ─── Python (scripts/) ───────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+*.egg
+.eggs/
+build/
+develop-eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+MANIFEST
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+*.pyc
+
+# ─── Generated / build output ────────────────────────────────────────────────
+dist/
+out/
+*.min.js
+*.bundle.js
+
+# ─── OS ──────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# ─── Editors ─────────────────────────────────────────────────────────────────
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json.example
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# ─── Testing & coverage ──────────────────────────────────────────────────────
+coverage/
+.coverage
+.nyc_output/
+*.lcov
+htmlcov/
+test-results/
+junit.xml
+
+# ─── Logs & temp ─────────────────────────────────────────────────────────────
+*.log
+logs/
+tmp/
+temp/
