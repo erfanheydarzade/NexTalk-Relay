@@ -455,18 +455,27 @@ async function handleRegister(request, env, shardUrls) {
   const capExp = Date.now() + CAPABILITY_TTL_SECONDS * 1000
 
   const signingKey = await importSigningKey(env.ROUTER_SIGNING_KEY)
-  const capSig = await signHex(signingKey, `cap:${mailboxId}:${readSecretHash}:${capExp}`)
+  // v2 capability: binds the cap to the owner's public key and a specific
+  // scope (mailbox.create), so a captured capability cannot be repurposed
+  // for reading and cannot be claimed by a client with a different identity.
+  const capNonce = randomHex(16)
+  const capSig = await signHex(
+    signingKey,
+    `cap:v2:${mailboxId}:${pubkey.toLowerCase()}:mailbox.create:${capExp}:${capNonce}`,
+  )
 
-  // The capability itself carries no shard-specific data, so the exact same
-  // signed cap can be presented to every replica's /create — that's what
-  // lets us fan this out to the whole replica set in one shot instead of
-  // needing a distinct capability per shard.
+  // The capability carries no shard-specific data, so the exact same signed
+  // cap can be presented to every replica's /create — fanning to the whole
+  // replica set in one shot without needing a distinct capability per shard.
   const createBody = JSON.stringify({
     mailbox_id: mailboxId,
     read_secret_hash: readSecretHash,
     cap_exp: capExp,
     cap_sig: capSig,
     replica_shard_urls: replicas,
+    cap_version: 2,
+    client_pubkey: pubkey.toLowerCase(),
+    cap_nonce: capNonce,
   })
 
   const createResults = await Promise.all(

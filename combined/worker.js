@@ -291,8 +291,16 @@ async function pushRoutingTableToShards(env, shardUrls) {
   return { version: signed.version, results }
 }
 
-async function localCreate(env, cfg, mailboxId, readSecretHash, capExp, capSig, replicas) {
-  const capOk = await verifyCapability(mailboxId.toLowerCase(), readSecretHash.toLowerCase(), Number(capExp), capSig, env.ROUTER_SIGNING_PUBLIC)
+// v2opts = { clientPubkey, capNonce } when a v2 capability was used; null for v1.
+async function localCreate(env, cfg, mailboxId, readSecretHash, capExp, capSig, replicas, v2opts) {
+  let capOk
+  if (v2opts) {
+    capOk = await verifyCapabilityV2(
+      mailboxId.toLowerCase(), v2opts.clientPubkey, "mailbox.create", Number(capExp), v2opts.capNonce, capSig, env.ROUTER_SIGNING_PUBLIC,
+    )
+  } else {
+    capOk = await verifyCapability(mailboxId.toLowerCase(), readSecretHash.toLowerCase(), Number(capExp), capSig, env.ROUTER_SIGNING_PUBLIC)
+  }
   if (!capOk) return { ok: false }
   const safeReplicas = Array.isArray(replicas) ? replicas.filter(u => typeof u === "string") : []
   const kvKey = `mailbox:${mailboxId.toLowerCase()}`
@@ -301,6 +309,7 @@ async function localCreate(env, cfg, mailboxId, readSecretHash, capExp, capSig, 
     let stored
     try { stored = JSON.parse(existingRaw) } catch { stored = { messages: [], createdAt: Date.now(), messagesEnqueuedAt: null } }
     stored.readSecretHash = readSecretHash.toLowerCase()
+    if (v2opts?.clientPubkey) stored.clientPubkey = v2opts.clientPubkey.toLowerCase()
     if (safeReplicas.length) stored.replicaShardUrls = safeReplicas
     await env.MAILBOX_KV.put(kvKey, JSON.stringify(stored), { expirationTtl: cfg.MAILBOX_TTL_SECONDS })
     return { ok: true, created: false }
@@ -309,6 +318,9 @@ async function localCreate(env, cfg, mailboxId, readSecretHash, capExp, capSig, 
     kvKey,
     JSON.stringify({
       readSecretHash: readSecretHash.toLowerCase(),
+      // clientPubkey stored when a v2 cap was used — enables future read-time
+      // identity verification without the shard learning it from send/routing paths.
+      clientPubkey: v2opts?.clientPubkey ? v2opts.clientPubkey.toLowerCase() : null,
       messages: [],
       createdAt: Date.now(),
       messagesEnqueuedAt: null,
@@ -322,7 +334,8 @@ async function localCreate(env, cfg, mailboxId, readSecretHash, capExp, capSig, 
 async function createOnReplica(env, cfg, replicaUrl, createBody) {
   if (replicaUrl === env.SELF_URL) {
     const parsed = JSON.parse(createBody)
-    const res = await localCreate(env, cfg, parsed.mailbox_id, parsed.read_secret_hash, parsed.cap_exp, parsed.cap_sig, parsed.replica_shard_urls)
+    const v2opts = parsed.cap_version === 2 ? { clientPubkey: parsed.client_pubkey, capNonce: parsed.cap_nonce } : null
+    const res = await localCreate(env, cfg, parsed.mailbox_id, parsed.read_secret_hash, parsed.cap_exp, parsed.cap_sig, parsed.replica_shard_urls, v2opts)
     return { url: replicaUrl, ok: res.ok }
   }
   try {
@@ -363,7 +376,13 @@ async function handleRegister(request, env, shardUrls, cfg) {
   const capExp = Date.now() + CAPABILITY_TTL_SECONDS * 1000
 
   const signingKey = await importSigningKey(env.ROUTER_SIGNING_KEY)
-  const capSig = await signHex(signingKey, `cap:${mailboxId}:${readSecretHash}:${capExp}`)
+  // v2 capability: binds to owner's public key and mailbox.create scope so a
+  // captured cap cannot be repurposed for reading or transferred to another client.
+  const capNonce = randomHex(16)
+  const capSig = await signHex(
+    signingKey,
+    `cap:v2:${mailboxId}:${pubkey.toLowerCase()}:mailbox.create:${capExp}:${capNonce}`,
+  )
 
   const createBody = JSON.stringify({
     mailbox_id: mailboxId,
@@ -371,6 +390,9 @@ async function handleRegister(request, env, shardUrls, cfg) {
     cap_exp: capExp,
     cap_sig: capSig,
     replica_shard_urls: replicas,
+    cap_version: 2,
+    client_pubkey: pubkey.toLowerCase(),
+    cap_nonce: capNonce,
   })
 
   const createResults = await Promise.all(replicas.map(url => createOnReplica(env, cfg, url, createBody)))
@@ -603,6 +625,16 @@ async function verifyCapability(mailboxId, readSecretHash, capExp, capSig, route
   return verifyEd25519(routerPublicHex, message, capSig)
 }
 
+// v2 capability format: cap:v2:{mailbox_id}:{client_pubkey}:{scope}:{cap_exp}:{nonce}
+// Binds the capability to the owner's Ed25519 public key and an explicit
+// operation scope so a captured create-cap cannot be repurposed to read,
+// and a capability stolen from one client cannot be used by another.
+async function verifyCapabilityV2(mailboxId, clientPubkey, scope, capExp, nonce, capSig, routerPublicHex) {
+  if (Date.now() > Number(capExp)) return false
+  const message = `cap:v2:${mailboxId}:${clientPubkey.toLowerCase()}:${scope}:${capExp}:${nonce}`
+  return verifyEd25519(routerPublicHex, message, capSig)
+}
+
 async function verifySenderAuth(auth, env, maxSkewMs, signedMessage) {
   const { pubkey, timestamp, signature } = auth ?? {}
 
@@ -632,17 +664,32 @@ async function handleCreate(request, env, cfg) {
   let body
   try { body = await request.json() } catch { return err("Request body must be valid JSON") }
 
-  const { mailbox_id: mailboxId, read_secret_hash: readSecretHash, cap_exp: capExp, cap_sig: capSig, replica_shard_urls: replicaShardUrls } = body || {}
+  const {
+    mailbox_id: mailboxId,
+    read_secret_hash: readSecretHash,
+    cap_exp: capExp,
+    cap_sig: capSig,
+    replica_shard_urls: replicaShardUrls,
+    cap_version: capVersion,
+    client_pubkey: clientPubkey,
+    cap_nonce: capNonce,
+  } = body || {}
 
   if (!mailboxId || typeof mailboxId !== "string" || !/^[0-9a-f]{16,128}$/i.test(mailboxId)) return err("mailbox_id must be a hex string")
   if (!readSecretHash || typeof readSecretHash !== "string" || !/^[0-9a-f]{64}$/i.test(readSecretHash)) return err("read_secret_hash must be a 64-char hex SHA-256 digest")
   if (!capExp || !Number.isFinite(Number(capExp))) return err("cap_exp is required")
   if (!capSig || typeof capSig !== "string") return err("cap_sig is required")
 
+  if (Number(capVersion) === 2) {
+    if (!clientPubkey || !/^[0-9a-f]{64}$/i.test(clientPubkey)) return err("client_pubkey must be 64-char hex for v2 capability")
+    if (!capNonce || typeof capNonce !== "string") return err("cap_nonce is required for v2 capability")
+  }
+
   const ipOk = await rateLimit(env, `create-ip:${clientIp(request)}`, cfg.MAX_CREATES_PER_IP, 60)
   if (!ipOk) return err("Too many create requests, slow down", 429, { "Retry-After": "60" })
 
-  const result = await localCreate(env, cfg, mailboxId, readSecretHash, capExp, capSig, replicaShardUrls)
+  const v2opts = Number(capVersion) === 2 ? { clientPubkey: clientPubkey.toLowerCase(), capNonce } : null
+  const result = await localCreate(env, cfg, mailboxId, readSecretHash, capExp, capSig, replicaShardUrls, v2opts)
   if (!result.ok) return err("invalid or expired Router capability", 401)
   return json({ mailbox_id: mailboxId.toLowerCase(), expires_in: cfg.MAILBOX_TTL_SECONDS, created: result.created })
 }
