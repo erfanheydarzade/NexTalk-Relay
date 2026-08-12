@@ -433,7 +433,7 @@ async function handleRegister(request, env, shardUrls) {
   let body
   try { body = await request.json() } catch { return jsonErr("Request body must be valid JSON", 400) }
 
-  const { pubkey, timestamp, signature } = body || {}
+  const { pubkey, timestamp, signature, request_id: requestId } = body || {}
   if (!pubkey || !/^[0-9a-f]{64}$/i.test(pubkey)) return jsonErr("pubkey must be 64-char hex", 400)
   if (!timestamp || !/^\d+$/.test(timestamp)) return jsonErr("timestamp required", 400)
   if (!signature || !/^[0-9a-f]{128}$/i.test(signature)) return jsonErr("signature must be 128-char hex", 400)
@@ -511,12 +511,19 @@ async function handleRegister(request, env, shardUrls) {
     replica_shard_urls: replicas,
     expires_at: capExp,
     table_version: await getRoutingTableVersion(env),
-  };
+  }
 
-  console.log("REGISTER RESPONSE:");
-  console.log(JSON.stringify(response));
+  console.log("REGISTER RESPONSE:")
+  console.log(JSON.stringify(response))
 
-  return jsonOk(response);
+  // If the client supplied a request_id, wrap the response in a Router-
+  // signed envelope so it can verify the response was not fabricated by a
+  // MITM who intercepted the HTTP connection.
+  if (requestId) {
+    const signed = await buildSignedResponse(env, requestId, 200, response)
+    return jsonOk(signed)
+  }
+  return jsonOk(response)
 }
 
 // ─── GET /resolve?pubkey=... ─────────────────────────────────────────────────
@@ -744,6 +751,31 @@ async function handleServerHello(request, env) {
     timestamp,
     signature,
   })
+}
+
+// ─── Signed response envelope (Router-side) ──────────────────────────────────
+//
+// Wraps a response body in a Router-signed envelope so the client can verify
+// the response genuinely came from this Router and was not fabricated or
+// replayed by a MITM. Covers request_id + status + timestamp + SHA-256(body).
+// The client must supply a request_id in their request to trigger this path.
+async function buildSignedResponse(env, requestId, status, body) {
+  const timestamp = String(Date.now())
+  const bodyJson = JSON.stringify(body)
+  const bodyHash = await sha256Hex(bodyJson)
+  const signedData = `${requestId}:${status}:${timestamp}:${bodyHash}`
+  const signingKey = await importSigningKey(env.ROUTER_SIGNING_KEY)
+  const signature = await signHex(signingKey, signedData)
+  return {
+    version: 1,
+    request_id: requestId,
+    status,
+    timestamp,
+    body_hash: bodyHash,
+    body,
+    server_public_key: env.ROUTER_SIGNING_PUBLIC,
+    signature,
+  }
 }
 
 // ─── Main fetch handler ──────────────────────────────────────────────────────

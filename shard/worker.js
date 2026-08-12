@@ -524,7 +524,17 @@ async function handleSend(request, env, cfg, ctx) {
     ctx.waitUntil(replicateToSiblings(env, mailboxId.toLowerCase(), newEntry, stored.replicaShardUrls))
   }
 
-  return json({ success: true, queued: stored.messages.length })
+  const sendResult = { success: true, queued: stored.messages.length }
+
+  // If the sender included a request_id, return a shard-signed response so
+  // the client can verify it was not fabricated by a MITM hiding a delivery
+  // failure, or a fake "429" suppressing a legitimate send.
+  const requestId = body.request_id || null
+  if (requestId && typeof requestId === "string") {
+    const signed = await buildShardSignedResponse(env, requestId, 200, sendResult)
+    return json(signed)
+  }
+  return json(sendResult)
 }
 
 
@@ -758,6 +768,7 @@ async function handleRead(request, env, cfg) {
   const mailboxId = params.get("mailbox_id")
   const readSecret = params.get("read_secret")
   const peek = params.get("peek") === "1"
+  const requestId = params.get("request_id") || null
 
   if (!mailboxId || !/^[0-9a-f]{16,128}$/i.test(mailboxId)) return err("mailbox_id required", 400)
   if (!readSecret || typeof readSecret !== "string") return err("read_secret required", 400)
@@ -791,12 +802,21 @@ async function handleRead(request, env, cfg) {
 
   await env.MAILBOX_KV.put(kvKey, JSON.stringify(stored), { expirationTtl: cfg.MAILBOX_TTL_SECONDS })
 
-  return json({
+  const readResult = {
     messages: messagesToReturn,
     count: messagesToReturn.length,
     createdAt: stored.createdAt,
     consumed: !peek,
-  })
+  }
+
+  // If the reader supplied a request_id, return a shard-signed response so
+  // the client can verify "messages: []" genuinely means the mailbox is empty
+  // and was not fabricated by an attacker to suppress message delivery.
+  if (requestId) {
+    const signed = await buildShardSignedResponse(env, requestId, 200, readResult)
+    return json(signed)
+  }
+  return json(readResult)
 }
 
 async function handleHealth(request, env) {
@@ -886,7 +906,34 @@ async function handleRoutingTableServe(env) {
   })
 }
 
-// ─── POST /server_hello — prove shard identity to a connecting client ─────────
+// ─── Signed response envelope (shard-side) ────────────────────────────────────
+//
+// Wraps a response body in a shard-signed envelope. Covers
+// request_id + status + timestamp + SHA-256(body), so a MITM cannot
+// fabricate "messages: []" or "401 Unauthorized" and present it as a
+// genuine shard response. The client verifies using the shard's public key
+// (from the Router-signed routing table).
+async function buildShardSignedResponse(env, requestId, status, body) {
+  const identity = await ensureShardIdentity(env)
+  const privKey = await importShardPrivateKey(identity.privateKeyPkcs8Base64)
+  const timestamp = String(Date.now())
+  const bodyJson = JSON.stringify(body)
+  const bodyHash = await sha256Hex(bodyJson)
+  const signedData = `${requestId}:${status}:${timestamp}:${bodyHash}`
+  const signature = await signWithShardKey(privKey, signedData)
+  return {
+    version: 1,
+    request_id: requestId,
+    status,
+    timestamp,
+    body_hash: bodyHash,
+    body,
+    server_public_key: identity.publicKeyHex,
+    signature,
+  }
+}
+
+// ─── POST /server_hello — prove shard identity to a connecting client ─────────────
 //
 // The client generates a fresh random nonce and POSTs it here. The shard
 // signs a payload binding the nonce, protocol version, and its own public key
