@@ -129,7 +129,7 @@ echo.
 set /p DEVPORT="Port to listen on (default 8788, blank = default): "
 if "%DEVPORT%"=="" set "DEVPORT=8788"
 echo.
-echo Starting: wrangler dev --port %DEVPORT%
+echo Starting: wrangler dev --port %DEVPORT% --ip 0.0.0.0
 echo Press Ctrl+C to stop the dev server.
 echo ------------------------------------------------------------
 call wrangler dev --port %DEVPORT%
