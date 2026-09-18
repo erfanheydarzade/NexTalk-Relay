@@ -214,6 +214,12 @@ NexTalk-Relay/
 ├── combined/
 │   ├── worker.js              # Single-file shard + router for simple one-Worker deployments
 │   └── wrangler.toml.example  # Config for the combined deployment
+├── transports/
+│   └── nextalk-relay/         # Installable NexTalk transport (.ntx): courier
+│       │                       bridge + manifest + package scripts (see its README)
+│       ├── manifest.json      # Package metadata (manifest.windows.json for .exe)
+│       ├── bridge/            # Go stdio-RPC ↔ Relay-JSON bridge (message ops 1–10)
+│       └── package.sh / package.ps1  # Build nextalk-relay.ntx
 ├── scripts/
 │   ├── generate.py            # Generate all Router secrets (SERVER_SECRET, signing keypair)
 │   ├── generate.html          # Browser-based version of the same generator
@@ -234,6 +240,42 @@ NexTalk-Relay/
 ## Releasing
 
 Releases are cut with one button — see [`docs/RELEASING.md`](docs/RELEASING.md). The changelog is generated automatically from Conventional Commit messages.
+
+## Interop with the NexTalk transport runtime
+
+NexTalk clients reach this relay through the built-in `worker` transport
+(`WORKER_URL`), whose frames flow through the same shared dispatch
+(`internal/dispatch`) as every external transport — an offer, answer, or
+message behaves identically no matter which transport carried it. No changes
+were needed here for the runtime system, and none are planned: this relay
+stays the JSON API below; the binary-first
+[FileRelay](https://github.com/erfanheydarzade/NexTalk-FileRelay) is a
+separate transport with its own repo, wire protocol, and runnable server
+(`filerelayd`). Run both side by side during migration —
+`nextalk worker listen` for this relay, `nextalk transport poll filerelay`
+for FileRelay — with history shared per identity.
+
+### Install this relay as a NexTalk transport (`.ntx`)
+
+`transports/nextalk-relay/` packages this relay's Router + shard API as a
+courier bridge NexTalk installs with no rebuild — the same pattern as
+FileRelay's `transports/filerelay/`, message capability only:
+
+```bash
+cd transports/nextalk-relay
+./package.sh        # -> nextalk-relay.ntx (vet + tests run first)
+# Windows: .\package.ps1
+
+nextalk transport install nextalk-relay.ntx --enable
+nextalk transport config nextalk-relay '{"router_url":"https://<your-router>.workers.dev"}'
+nextalk transport register nextalk-relay --user alice --router https://<your-router>.workers.dev
+nextalk transport poll nextalk-relay -i <YOU>   # like worker listen
+```
+
+The bridge signs with its own courier/scoped keys (never user keys) and
+hands core deterministic 16-byte mailbox aliases for the relay's 32-byte
+mailbox IDs — see [`transports/nextalk-relay/README.md`](transports/nextalk-relay/README.md)
+for the trust model, aliasing, and the two-user scenario.
 
 ---
 
