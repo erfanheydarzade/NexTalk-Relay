@@ -50,3 +50,28 @@ jobs:
         run: |
           cp combined/wrangler.toml.example combined/wrangler.toml
           cd combined && wrangler deploy --dry-run --outdir /tmp/combined-build
+
+  bridge:
+    name: Bridge Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21.0"
+
+      - name: Vet + test the .ntx courier bridge
+        run: |
+          cd transports/nextalk-relay
+          go vet ./...
+          go test ./... -count=1
+
+      - name: Package check (manifest + entry at zip root)
+        run: |
+          cd transports/nextalk-relay
+          bash ./package.sh
+          unzip -l nextalk-relay.ntx
+          rm -f nextalk-relay.ntx nextalk-relay-bridge

@@ -66,6 +66,15 @@ out/
 *.min.js
 *.bundle.js
 
+# ─── NexTalk transport packages (transports/nextalk-relay/) ──────────────────
+# .ntx files are release artifacts: zip of manifest.json + entry binary.
+*.ntx
+nextalk-relay-bridge
+nextalk-relay-bridge.exe
+# Bridge runtime state (secrets — never commit; *.key already covers
+# courier.key and scoped-*.key above).
+mailbox-map.json
+
 # ─── OS ──────────────────────────────────────────────────────────────────────
 .DS_Store
 .DS_Store?

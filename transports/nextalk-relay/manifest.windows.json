@@ -1,0 +1,15 @@
+{
+  "id": "nextalk-relay",
+  "name": "NexTalk Relay",
+  "version": "1.0.0",
+  "api_version": "1",
+  "entry": "nextalk-relay-bridge.exe",
+  "capabilities": [
+    "message"
+  ],
+  "permissions": [
+    "network",
+    "storage"
+  ],
+  "description": "NexTalk-Relay courier transport: carries opaque NexTalk frames as relay messages under its own courier/scoped identities. Never sees user keys."
+}
