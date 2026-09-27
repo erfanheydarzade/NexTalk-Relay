@@ -1,8 +1,8 @@
 name: Release
 
 # Releases are created from this workflow only.
-# The workflow creates a DRAFT release (and its tag) on the selected main
-# commit, builds and verifies the Workers plus the installable .ntx courier
+# The workflow creates a DRAFT release targeting the selected main commit,
+# builds and verifies the Workers plus the installable .ntx courier
 # transport bundles, uploads every asset, then publishes the release.
 #
 # Do not push release tags manually. With GitHub release immutability enabled,
@@ -245,25 +245,23 @@ jobs:
             echo "created=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Resolve and verify release tag
+      - name: Verify draft release target
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          git fetch --tags origin --force
-          git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
+          release_json="$(gh release view "$TAG"             --repo "${GITHUB_REPOSITORY}"             --json isDraft,isImmutable,tagName,targetCommitish)"
 
-          TAG_SHA="$(git rev-list -n 1 "$TAG")"
-          echo "TAG_SHA=$TAG_SHA" >> "$GITHUB_ENV"
+          jq -e             --arg tag "$TAG"             --arg sha "$RELEASE_SHA"             '
+              .isDraft == true
+              and .isImmutable == false
+              and .tagName == $tag
+              and .targetCommitish == $sha
+            ' <<< "$release_json" >/dev/null
 
-          if [[ "$TAG_SHA" != "$RELEASE_SHA" ]]; then
-            echo "::error::Release tag $TAG does not point to the workflow commit."
-            echo "::error::Tag SHA:      $TAG_SHA"
-            echo "::error::Commit SHA:   $RELEASE_SHA"
-            exit 1
-          fi
-
-          echo "Verified $TAG -> $RELEASE_SHA"
+          echo "Verified draft release $TAG targets $RELEASE_SHA."
 
       - name: Prepare release artifact directory
         shell: bash
@@ -529,8 +527,10 @@ jobs:
           is_immutable="$(jq -r '.isImmutable' <<< "$release_json")"
 
           if [[ "$is_draft" == "true" && "$is_immutable" != "true" ]]; then
-            echo "Cleaning up draft release $TAG and its tag."
-            gh release delete "$TAG"               --repo "${GITHUB_REPOSITORY}"               --yes               --cleanup-tag || true
+            echo "Cleaning up draft release $TAG."
+            # Publishing creates a new tag for a draft release when needed.
+            # Never delete a pre-existing tag as part of draft cleanup.
+            gh release delete "$TAG" --repo "${GITHUB_REPOSITORY}" --yes || true
           else
             echo "Release $TAG is published or immutable; refusing destructive cleanup."
           fi
