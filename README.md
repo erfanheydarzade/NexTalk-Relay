@@ -239,7 +239,7 @@ NexTalk-Relay/
 
 ## Releasing
 
-Releases are cut with one button — see [`docs/RELEASING.md`](docs/RELEASING.md). The changelog is generated automatically from Conventional Commit messages.
+Releases are cut with one button — see [`docs/RELEASING.md`](docs/RELEASING.md). Each immutable release contains the tagged Worker source revision plus six cross-platform `.ntx` courier transport bundles and their SHA-256 checksum file. The release notes are generated automatically from the commits included in the release.
 
 ## Interop with the NexTalk transport runtime
 
