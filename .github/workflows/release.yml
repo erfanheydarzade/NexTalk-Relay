@@ -1,187 +1,504 @@
 name: Release
 
-# Push a button instead of tagging-and-waiting: run this from the Actions
-# tab (Run workflow) and choose a version. It tags that version and publishes
-# a GitHub Release with an auto-generated, grouped changelog built from
-# Conventional Commit messages. There are no build artifacts — the Workers
-# are deployed directly from source via `wrangler deploy`, so the release is
-# purely the source tag + release notes.
+# Releases are created from this workflow only.
+# The workflow creates a DRAFT release (and its tag) on the selected main
+# commit, builds and verifies the Workers plus the installable .ntx courier
+# transport bundles, uploads every asset, then publishes the release.
 #
-# Re-running this workflow for a version that's already released is safe:
-# the "Tag release" step is a no-op if the tag already exists, and the
-# release action updates the existing release's notes rather than failing.
+# Do not push release tags manually. With GitHub release immutability enabled,
+# a published tag is permanently bound to its release and cannot be reused.
+
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: >-
-          Version to release, e.g. v1.4.0 (must start with "v" and follow
-          semver). Leave the "prerelease" box checked for a beta/rc build.
+        description: "Version to release, e.g. v1.4.0 or v1.4.0-rc.1"
         required: true
         type: string
       prerelease:
-        description: "Mark this as a pre-release (not shown as 'latest')"
+        description: "Mark this as a pre-release"
         required: false
-        type: boolean
         default: false
-  # Also supports the traditional `git tag vX.Y.Z && git push --tags` flow
-  # for anyone who prefers that over the manual button.
-  push:
-    tags:
-      - "v*.*.*"
+        type: boolean
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
 
 jobs:
-  tag:
-    name: Tag release
+  validate:
+    name: Validate source
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-    outputs:
-      tag: ${{ steps.resolve.outputs.tag }}
+    timeout-minutes: 20
+
     steps:
-      - name: Validate version input
-        id: resolve
+      - name: Validate version and release branch
+        shell: bash
+        env:
+          TAG: ${{ inputs.version }}
         run: |
-          version="${{ inputs.version }}"
-          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::'$version' is not a valid semver tag (expected e.g. v1.4.0 or v1.4.0-rc.1)"
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF_NAME}" != "main" ]]; then
+            echo "::error::Releases must be cut from main. Selected ref: ${GITHUB_REF_NAME}"
             exit 1
           fi
-          echo "tag=$version" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Create and push tag (no-op if it already exists)
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          tag="${{ steps.resolve.outputs.tag }}"
-          if git rev-parse "$tag" >/dev/null 2>&1; then
-            echo "Tag $tag already exists, reusing it."
-          else
-            git tag -a "$tag" -m "Release $tag"
-            git push origin "$tag"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid release version: $TAG"
+            echo "::error::Expected v1.2.3 or v1.2.3-rc.1"
+            exit 1
           fi
 
-  release:
-    name: Publish release
-    needs: [tag]
-    if: always() && !failure() && !cancelled()
-    runs-on: ubuntu-latest
-    env:
-      RELEASE_TAG: ${{ needs.tag.outputs.tag || github.ref_name }}
-    steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
+          check-latest: false
 
-      - name: Syntax check — shard
-        run: node --check shard/worker.js
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.25.14"
+          cache: true
+          cache-dependency-path: transports/nextalk-relay/go.sum
 
-      - name: Syntax check — router
-        run: node --check router/router.js
-
-      - name: Syntax check — combined
-        run: node --check combined/worker.js
-
-      - name: Generate changelog
-        id: changelog
+      - name: Install pinned Wrangler
+        shell: bash
         run: |
-          PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${RELEASE_TAG}$" | head -1)
-          if [ -z "$PREV_TAG" ]; then
-            RANGE="HEAD"
-            COMPARE_LINE=""
-          else
-            RANGE="${PREV_TAG}..HEAD"
-            COMPARE_LINE="**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${RELEASE_TAG}"
+          set -euo pipefail
+          npm install --global wrangler@4.141.0
+          wrangler --version
+
+      - name: Check Worker JavaScript syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check shard/worker.js
+          node --check router/router.js
+          node --check combined/worker.js
+
+      - name: Dry-run Worker deployments
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for worker in shard router combined; do
+            echo
+            echo "==> Dry-run: $worker"
+
+            (
+              cd "$worker"
+              cp wrangler.toml.example wrangler.toml
+
+              case "$worker" in
+                shard)
+                  wrangler deploy --dry-run --outdir "$RUNNER_TEMP/shard-build"
+                  ;;
+                router)
+                  wrangler deploy --dry-run --outdir "$RUNNER_TEMP/router-build"
+                  ;;
+                combined)
+                  wrangler deploy --dry-run --outdir "$RUNNER_TEMP/combined-build"
+                  ;;
+              esac
+
+              rm -f wrangler.toml
+            )
+          done
+
+      - name: Verify Worker dry-runs left no worktree changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "::error::Worker validation modified the Git worktree."
+            git status --short
+            exit 1
           fi
 
-          pick_commits() {
-            local pattern="$1"
-            git log "$RANGE" --pretty=format:"- %s" \
-              --grep="$pattern" \
-              --perl-regexp \
-              --no-merges \
-              --invert-grep --grep="^Merge pull request" \
-              --invert-grep --grep="^Merge branch" \
-              --invert-grep --grep="^ci:" \
-              --invert-grep --grep="^chore\(deps\):" \
-              2>/dev/null | grep -P "$pattern" || true
+      - name: Validate bridge module
+        working-directory: transports/nextalk-relay
+        shell: bash
+        env:
+          GOFLAGS: -mod=readonly
+        run: |
+          set -euo pipefail
+
+          go mod download
+          go mod verify
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./... -count=1
+
+  release:
+    name: Build and publish
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      TAG: ${{ inputs.version }}
+      PRERELEASE: ${{ inputs.prerelease }}
+      GO_VERSION: "1.25.14"
+      NTX_DIST: ${{ runner.temp }}/nextalk-relay-ntx
+
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "${{ env.GO_VERSION }}"
+          cache: true
+          cache-dependency-path: transports/nextalk-relay/go.sum
+
+      - name: Resolve release commit
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF_NAME}" != "main" ]]; then
+            echo "::error::Releases must be cut from main."
+            exit 1
+          fi
+
+          git fetch --tags origin --force
+
+          RELEASE_SHA="$(git rev-parse HEAD)"
+          echo "release_sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_SHA=$RELEASE_SHA" >> "$GITHUB_ENV"
+
+          echo "Release tag: $TAG"
+          echo "Release commit: $RELEASE_SHA"
+
+      - name: Prepare draft GitHub release
+        id: prepare
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if release_json="$(gh release view "$TAG"             --repo "${GITHUB_REPOSITORY}"             --json isDraft,isImmutable,tagName,targetCommitish,url 2>/dev/null)"; then
+
+            is_draft="$(jq -r '.isDraft' <<< "$release_json")"
+            is_immutable="$(jq -r '.isImmutable' <<< "$release_json")"
+
+            if [[ "$is_draft" != "true" || "$is_immutable" == "true" ]]; then
+              echo "::error::Release $TAG already exists as a published or immutable release."
+              echo "::error::Immutable release versions are one-shot. Use a new version."
+              exit 1
+            fi
+
+            echo "Reusing existing draft release $TAG."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            if git ls-remote --exit-code --refs origin "refs/tags/$TAG" >/dev/null 2>&1; then
+              git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
+              TAG_SHA="$(git rev-list -n 1 "$TAG")"
+
+              if [[ "$TAG_SHA" != "$RELEASE_SHA" ]]; then
+                echo "::error::Tag $TAG already exists at a different commit."
+                echo "::error::Tag commit:     $TAG_SHA"
+                echo "::error::Release commit: $RELEASE_SHA"
+                exit 1
+              fi
+
+              echo "Creating draft release for existing tag $TAG."
+              gh release create "$TAG"                 --repo "${GITHUB_REPOSITORY}"                 --draft                 --verify-tag                 --title "NexTalk-Relay $TAG"                 --notes "Cloudflare Workers relay release with installable NexTalk .ntx courier transport bundles."                 --generate-notes
+            else
+              echo "Creating draft release $TAG at $RELEASE_SHA."
+              gh release create "$TAG"                 --repo "${GITHUB_REPOSITORY}"                 --draft                 --target "$RELEASE_SHA"                 --title "NexTalk-Relay $TAG"                 --notes "Cloudflare Workers relay release with installable NexTalk .ntx courier transport bundles."                 --generate-notes
+            fi
+
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve and verify release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch --tags origin --force
+          git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
+
+          TAG_SHA="$(git rev-list -n 1 "$TAG")"
+          echo "TAG_SHA=$TAG_SHA" >> "$GITHUB_ENV"
+
+          if [[ "$TAG_SHA" != "$RELEASE_SHA" ]]; then
+            echo "::error::Release tag $TAG does not point to the workflow commit."
+            echo "::error::Tag SHA:      $TAG_SHA"
+            echo "::error::Commit SHA:   $RELEASE_SHA"
+            exit 1
+          fi
+
+          echo "Verified $TAG -> $RELEASE_SHA"
+
+      - name: Build six .ntx courier bundles
+        working-directory: transports/nextalk-relay
+        shell: bash
+        env:
+          GOFLAGS: -mod=readonly
+        run: |
+          set -euo pipefail
+
+          VERSION="${TAG#v}"
+          rm -rf "$NTX_DIST"
+          mkdir -p "$NTX_DIST"
+
+          build_ntx() {
+            local goos="$1"
+            local goarch="$2"
+            local goarm="${3:-}"
+            local entry="nextalk-relay-bridge"
+            local manifest="manifest.json"
+
+            if [[ "$goos" == "windows" ]]; then
+              entry="nextalk-relay-bridge.exe"
+              manifest="manifest.windows.json"
+            fi
+
+            echo
+            echo "==> Building $goos/$goarch${goarm:+v$goarm}"
+
+            rm -f "$entry"
+            rm -rf .ntx-stage
+            mkdir -p .ntx-stage
+
+            if [[ -n "$goarm" ]]; then
+              GOOS="$goos" GOARCH="$goarch" GOARM="$goarm" CGO_ENABLED=0                 go build -trimpath -ldflags="-s -w" -o "$entry" ./bridge
+            else
+              GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0                 go build -trimpath -ldflags="-s -w" -o "$entry" ./bridge
+            fi
+
+            test -s "$entry"
+
+            jq --arg version "$VERSION"               '.version = $version'               "$manifest"               > .ntx-stage/manifest.json
+
+            jq -e               --arg version "$VERSION"               --arg id "nextalk-relay"               --arg entry "$entry"               '
+                .id == $id
+                and .version == $version
+                and .api_version == "1"
+                and .entry == $entry
+                and (.capabilities | index("message")) != null
+              '               .ntx-stage/manifest.json >/dev/null
+
+            cp "$entry" .ntx-stage/
+
+            SUFFIX="${goos}_${goarch}${goarm:+v$goarm}"
+            OUT="$NTX_DIST/nextalk-relay_${VERSION}_${SUFFIX}.ntx"
+
+            (
+              cd .ntx-stage
+              zip -q -j "$OUT" manifest.json "$entry"
+            )
+
+            test -s "$OUT"
+            unzip -tq "$OUT"
+
+            unzip -p "$OUT" manifest.json               | jq -e                   --arg version "$VERSION"                   --arg entry "$entry"                   '.version == $version and .entry == $entry'               >/dev/null
+
+            unzip -l "$OUT" | grep -Eq '[[:space:]]manifest\.json$'
+            unzip -l "$OUT" | grep -Eq "[[:space:]]${entry//./\.}$"
+
+            rm -rf .ntx-stage "$entry"
+
+            echo "Packaged: $OUT"
           }
 
-          FEATURES=$(git log "$RANGE" --pretty=format:"- %s" --no-merges 2>/dev/null \
-            | grep -P '^- feat(\([^)]+\))?!?:' || true)
-          FIXES=$(git log "$RANGE" --pretty=format:"- %s" --no-merges 2>/dev/null \
-            | grep -P '^- fix(\([^)]+\))?!?:' || true)
-          DOCS=$(git log "$RANGE" --pretty=format:"- %s" --no-merges 2>/dev/null \
-            | grep -P '^- docs(\([^)]+\))?!?:' || true)
-          BUILD=$(git log "$RANGE" --pretty=format:"- %s" --no-merges 2>/dev/null \
-            | grep -P '^- (build|perf|refactor)(\([^)]+\))?!?:' || true)
-          OTHER=$(git log "$RANGE" --pretty=format:"- %s" --no-merges 2>/dev/null \
-            | grep -vP '^- (feat|fix|docs|build|perf|refactor|ci|chore|test)(\([^)]+\))?!?:' \
-            | grep -vP '^- Merge' || true)
+          build_ntx linux amd64
+          build_ntx linux arm64
+          build_ntx linux arm 7
+          build_ntx darwin amd64
+          build_ntx darwin arm64
+          build_ntx windows amd64
 
-          BODY=""
-          if [ -n "$FEATURES" ]; then
-            BODY="${BODY}### Features\n\n${FEATURES}\n\n"
-          fi
-          if [ -n "$FIXES" ]; then
-            BODY="${BODY}### Fixes\n\n${FIXES}\n\n"
-          fi
-          if [ -n "$DOCS" ]; then
-            BODY="${BODY}### Documentation\n\n${DOCS}\n\n"
-          fi
-          if [ -n "$BUILD" ]; then
-            BODY="${BODY}### Build & tooling\n\n${BUILD}\n\n"
-          fi
-          if [ -n "$OTHER" ]; then
-            BODY="${BODY}### Other\n\n${OTHER}\n\n"
-          fi
-          if [ -z "$BODY" ]; then
-            BODY="No user-facing changes in this release.\n\n"
+          count="$(find "$NTX_DIST" -maxdepth 1 -type f -name '*.ntx' | wc -l)"
+          if [[ "$count" -ne 6 ]]; then
+            echo "::error::Expected exactly 6 .ntx bundles, found $count."
+            find "$NTX_DIST" -maxdepth 1 -type f -print
+            exit 1
           fi
 
-          HEADER="## NexTalk-Relay ${RELEASE_TAG}\n\nAnonymous, burn-after-read mailbox relay for [NexTalk](https://github.com/erfanheydarzade/NexTalk) — deployed as Cloudflare Workers, no binary artifacts required.\n\n### Deploying\n\nSee the [README](https://github.com/${{ github.repository }}/blob/${RELEASE_TAG}/README.md) for full setup instructions.\n\n"
+          echo
+          echo "==> Six .ntx bundles verified:"
+          ls -lh "$NTX_DIST"
 
-          FULL="${HEADER}${BODY}"
-          if [ -n "$COMPARE_LINE" ]; then
-            FULL="${FULL}---\n${COMPARE_LINE}"
-          fi
-
-          # Write to a file to safely pass multi-line content
-          printf "%b" "$FULL" > /tmp/release_notes.md
-          echo "prev_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Create or update GitHub Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate and verify .ntx checksums
+        shell: bash
         run: |
-          if gh release view "${RELEASE_TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release edit "${RELEASE_TAG}" \
-              --repo "${{ github.repository }}" \
-              --notes-file /tmp/release_notes.md \
-              --title "NexTalk-Relay ${RELEASE_TAG}"
+          set -euo pipefail
+
+          cd "$NTX_DIST"
+
+          sha256sum nextalk-relay_*.ntx > nextalk-relay_checksums.txt
+          sha256sum -c nextalk-relay_checksums.txt
+
+          test -s nextalk-relay_checksums.txt
+          test "$(wc -l < nextalk-relay_checksums.txt)" -eq 6
+
+      - name: Install pinned Wrangler
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          check-latest: false
+
+      - name: Install Wrangler CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global wrangler@4.141.0
+          wrangler --version
+
+      - name: Final source sanity check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          node --check shard/worker.js
+          node --check router/router.js
+          node --check combined/worker.js
+
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "::error::Release build modified the source worktree."
+            git status --short
+            exit 1
+          fi
+
+      - name: Generate .ntx artifact attestation
+        uses: actions/attest@v4
+        with:
+          subject-checksums: ${{ env.NTX_DIST }}/nextalk-relay_checksums.txt
+
+      - name: Upload .ntx assets to draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          assets=(
+            "$NTX_DIST/nextalk-relay_${TAG#v}_linux_amd64.ntx"
+            "$NTX_DIST/nextalk-relay_${TAG#v}_linux_arm64.ntx"
+            "$NTX_DIST/nextalk-relay_${TAG#v}_linux_armv7.ntx"
+            "$NTX_DIST/nextalk-relay_${TAG#v}_darwin_amd64.ntx"
+            "$NTX_DIST/nextalk-relay_${TAG#v}_darwin_arm64.ntx"
+            "$NTX_DIST/nextalk-relay_${TAG#v}_windows_amd64.ntx"
+            "$NTX_DIST/nextalk-relay_checksums.txt"
+          )
+
+          for asset in "${assets[@]}"; do
+            test -s "$asset"
+          done
+
+          gh release upload "$TAG" "${assets[@]}"             --repo "${GITHUB_REPOSITORY}"             --clobber
+
+      - name: Verify draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t actual < <(
+            gh release view "$TAG"               --repo "${GITHUB_REPOSITORY}"               --json isDraft,isImmutable,tagName,targetCommitish,assets               --jq '.assets[].name'               | sort
+          )
+
+          expected=(
+            "nextalk-relay_${TAG#v}_darwin_amd64.ntx"
+            "nextalk-relay_${TAG#v}_darwin_arm64.ntx"
+            "nextalk-relay_${TAG#v}_linux_amd64.ntx"
+            "nextalk-relay_${TAG#v}_linux_arm64.ntx"
+            "nextalk-relay_${TAG#v}_linux_armv7.ntx"
+            "nextalk-relay_${TAG#v}_windows_amd64.ntx"
+            "nextalk-relay_checksums.txt"
+          )
+
+          printf '%s\n' "${expected[@]}" | sort > "$RUNNER_TEMP/expected-assets.txt"
+          printf '%s\n' "${actual[@]}" > "$RUNNER_TEMP/actual-assets.txt"
+
+          if ! diff -u "$RUNNER_TEMP/expected-assets.txt" "$RUNNER_TEMP/actual-assets.txt"; then
+            echo "::error::Draft release assets do not match the exact expected set."
+            exit 1
+          fi
+
+          echo "Verified exactly ${#actual[@]} release assets."
+
+      - name: Publish immutable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$PRERELEASE" == "true" ]]; then
+            gh release edit "$TAG"               --repo "${GITHUB_REPOSITORY}"               --draft=false               --prerelease
           else
-            gh release create "${RELEASE_TAG}" \
-              --repo "${{ github.repository }}" \
-              --notes-file /tmp/release_notes.md \
-              --title "NexTalk-Relay ${RELEASE_TAG}"
+            gh release edit "$TAG"               --repo "${GITHUB_REPOSITORY}"               --draft=false               --prerelease=false
           fi
 
-      - name: Mark pre-release if requested
-        if: github.event_name == 'workflow_dispatch' && inputs.prerelease
+          echo "Published $TAG"
+
+      - name: Verify immutable release
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release edit "${RELEASE_TAG}" --repo "${{ github.repository }}" --prerelease
+          set -euo pipefail
+
+          release_json="$(gh release view "$TAG"             --repo "${GITHUB_REPOSITORY}"             --json isDraft,isImmutable,isPrerelease,tagName,targetCommitish,assets,url)"
+
+          jq -e             --arg tag "$TAG"             --arg sha "$RELEASE_SHA"             --argjson prerelease "$PRERELEASE"             '
+              .isDraft == false
+              and .isImmutable == true
+              and .tagName == $tag
+              and .targetCommitish == $sha
+              and .isPrerelease == $prerelease
+            '             <<< "$release_json" >/dev/null
+
+          echo "Immutable release verified:"
+          jq -r '"\(.url)\nassets=\(.assets | length)\ntarget=\(.targetCommitish)"' <<< "$release_json"
+
+      - name: Cleanup draft release after failure
+        if: ${{ (failure() || cancelled()) && steps.prepare.outputs.created == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+
+          release_json="$(gh release view "$TAG"             --repo "${GITHUB_REPOSITORY}"             --json isDraft,isImmutable 2>/dev/null)"
+
+          if [[ -z "$release_json" ]]; then
+            echo "Release $TAG is not readable; leaving state untouched."
+            exit 0
+          fi
+
+          is_draft="$(jq -r '.isDraft' <<< "$release_json")"
+          is_immutable="$(jq -r '.isImmutable' <<< "$release_json")"
+
+          if [[ "$is_draft" == "true" && "$is_immutable" != "true" ]]; then
+            echo "Cleaning up draft release $TAG and its tag."
+            gh release delete "$TAG"               --repo "${GITHUB_REPOSITORY}"               --yes               --cleanup-tag || true
+          else
+            echo "Release $TAG is published or immutable; refusing destructive cleanup."
+          fi
