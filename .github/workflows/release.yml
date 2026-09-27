@@ -488,18 +488,27 @@ jobs:
         run: |
           set -euo pipefail
 
-          release_json="$(gh release view "$TAG"             --repo "${GITHUB_REPOSITORY}"             --json isDraft,isImmutable,isPrerelease,tagName,targetCommitish,assets,url)"
+          release_json="$(gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" --json isDraft,isImmutable,isPrerelease,tagName,assets,url)"
 
-          jq -e             --arg tag "$TAG"             --arg sha "$RELEASE_SHA"             --argjson prerelease "$PRERELEASE"             '
+          jq -e --arg tag "$TAG" --argjson prerelease "$PRERELEASE" '
               .isDraft == false
               and .isImmutable == true
               and .tagName == $tag
-              and .targetCommitish == $sha
               and .isPrerelease == $prerelease
-            '             <<< "$release_json" >/dev/null
+              and (.assets | length) == 7
+            ' <<< "$release_json" >/dev/null
 
           echo "Immutable release verified:"
           jq -r '"\(.url)\nassets=\(.assets | length)\ntarget=\(.targetCommitish)"' <<< "$release_json"
+
+      - name: Verify GitHub release attestation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          gh release verify "$TAG" --repo "${GITHUB_REPOSITORY}"
 
       - name: Cleanup draft release after failure
         if: ${{ (failure() || cancelled()) && steps.prepare.outputs.created == 'true' }}
