@@ -41,8 +41,8 @@ import (
 )
 
 type binding struct {
-	MailboxID  string `json:"mailbox_id"`             // full relay mailbox id (lowercase hex)
-	ReadSecret string `json:"read_secret,omitempty"`  // full read secret (hex), when known
+	MailboxID  string `json:"mailbox_id"`            // full relay mailbox id (lowercase hex)
+	ReadSecret string `json:"read_secret,omitempty"` // full read secret (hex), when known
 	ShardURL   string `json:"shard_url"`
 	RouterURL  string `json:"router_url,omitempty"`
 }
