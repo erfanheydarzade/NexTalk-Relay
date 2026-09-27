@@ -1111,9 +1111,9 @@ export default {
       if (url.pathname === "/admin/shard_info"  && request.method === "GET")  return await handleAdminShardInfo(request, env)
       if (url.pathname === "/admin/register"    && request.method === "POST") return await handleAdminRegister(request, env)
       if (url.pathname === "/admin/rotate_key"  && request.method === "POST") return await handleAdminRotateKey(request, env)
-    } catch (e) {
-      console.error("Unhandled error:", e)
-      return err("Internal server error", 500)
+    }  catch (e) {
+      console.error("Unhandled error:", e?.stack || String(e))
+      return err(`Internal server error: ${e?.message || String(e)}`, 500)
     }
 
     return new Response("Not Found", { status: 404, headers: CORS_HEADERS })

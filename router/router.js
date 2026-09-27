@@ -479,20 +479,28 @@ async function handleRegister(request, env, shardUrls) {
   })
 
   const createResults = await Promise.all(
-    replicas.map(url =>
-      fetch(`${url}/create`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: createBody,
-        signal: AbortSignal.timeout(10_000),
-      })
-        .then(resp => ({ url, ok: resp.ok }))
-        .catch(() => ({ url, ok: false })),
-    ),
+    replicas.map(async url => {
+      try {
+        const resp = await fetch(`${url}/create`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: createBody,
+          signal: AbortSignal.timeout(10_000),
+        })
+        const text = resp.ok ? "" : await resp.text().catch(() => "")
+        return { url, ok: resp.ok, status: resp.status, text }
+      } catch (e) {
+        return { url, ok: false, status: 0, text: String(e) }
+      }
+    }),
   )
 
   if (!createResults[0].ok) {
-    return jsonErr("Failed to create mailbox on primary shard", 502)
+    console.error("register: primary /create failed", createResults[0])
+    return jsonErr(
+      `Failed to create mailbox on primary shard (${createResults[0].status}: ${createResults[0].text.slice(0, 200)})`,
+      502,
+    )
   }
   const failedReplicas = createResults.slice(1).filter(res => !res.ok)
   if (failedReplicas.length) {
