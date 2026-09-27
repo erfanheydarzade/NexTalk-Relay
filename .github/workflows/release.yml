@@ -22,10 +22,7 @@ on:
         type: boolean
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
-  artifact-metadata: write
+  contents: read
 
 concurrency:
   group: release-${{ inputs.version }}
@@ -35,6 +32,8 @@ jobs:
   validate:
     name: Validate source
     runs-on: ubuntu-latest
+    outputs:
+      commit_sha: ${{ steps.commit.outputs.sha }}
     timeout-minutes: 20
 
     steps:
@@ -61,6 +60,16 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Capture validated commit
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SHA="$(git rev-parse HEAD)"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Validated commit: $SHA"
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -150,18 +159,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+
     env:
       TAG: ${{ inputs.version }}
       PRERELEASE: ${{ inputs.prerelease }}
+      RELEASE_SHA: ${{ needs.validate.outputs.commit_sha }}
       GO_VERSION: "1.25.14"
-      NTX_DIST: ${{ runner.temp }}/nextalk-relay-ntx
 
     steps:
-      - name: Checkout release source
+      - name: Checkout validated release source
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ needs.validate.outputs.commit_sha }}
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -170,25 +186,21 @@ jobs:
           cache: true
           cache-dependency-path: transports/nextalk-relay/go.sum
 
-      - name: Resolve release commit
-        id: source
+      - name: Verify validated release commit
         shell: bash
         run: |
           set -euo pipefail
 
-          if [[ "${GITHUB_REF_NAME}" != "main" ]]; then
-            echo "::error::Releases must be cut from main."
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+
+          if [[ "$ACTUAL_SHA" != "$RELEASE_SHA" ]]; then
+            echo "::error::Checked out commit does not match the validated commit."
+            echo "::error::Expected: $RELEASE_SHA"
+            echo "::error::Actual:   $ACTUAL_SHA"
             exit 1
           fi
 
-          git fetch --tags origin --force
-
-          RELEASE_SHA="$(git rev-parse HEAD)"
-          echo "release_sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
-          echo "RELEASE_SHA=$RELEASE_SHA" >> "$GITHUB_ENV"
-
-          echo "Release tag: $TAG"
-          echo "Release commit: $RELEASE_SHA"
+          echo "Using validated commit: $RELEASE_SHA"
 
       - name: Prepare draft GitHub release
         id: prepare
@@ -252,6 +264,17 @@ jobs:
           fi
 
           echo "Verified $TAG -> $RELEASE_SHA"
+
+      - name: Prepare release artifact directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export NTX_DIST="$RUNNER_TEMP/nextalk-relay-ntx"
+          echo "NTX_DIST=$NTX_DIST" >> "$GITHUB_ENV"
+
+          rm -rf "$NTX_DIST"
+          mkdir -p "$NTX_DIST"
 
       - name: Build six .ntx courier bundles
         working-directory: transports/nextalk-relay
