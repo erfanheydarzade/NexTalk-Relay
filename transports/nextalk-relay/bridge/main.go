@@ -48,15 +48,15 @@ type binding struct {
 }
 
 type bridge struct {
-	mu        sync.Mutex
-	running   bool
+	mu          sync.Mutex
+	running     bool
 	courierPriv ed25519.PrivateKey
-	scoped    map[string]ed25519.PrivateKey // userTag -> key
-	routerURL string                        // default from initialize config
-	relay     *relayClient
-	dir       string
-	aliases   map[string]*binding // aliasHex -> binding
-	attached  map[string]*binding // aliasHex -> live attachment (secret + shard)
+	scoped      map[string]ed25519.PrivateKey // userTag -> key
+	routerURL   string                        // default from initialize config
+	relay       *relayClient
+	dir         string
+	aliases     map[string]*binding // aliasHex -> binding
+	attached    map[string]*binding // aliasHex -> live attachment (secret + shard)
 }
 
 type bridgeConfig struct {
