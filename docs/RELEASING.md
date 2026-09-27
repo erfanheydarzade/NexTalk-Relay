@@ -1,72 +1,145 @@
 # Releasing NexTalk-Relay
 
-NexTalk-Relay releases are source-only — there are no compiled artifacts. A "release" is a tagged commit on `main` paired with a GitHub Release whose notes are generated automatically from Conventional Commit messages.
+NexTalk-Relay releases are immutable GitHub Releases built from a commit on `main`. Each release contains:
 
-## How to cut a release
+- the tagged source revision used to deploy the Cloudflare Workers;
+- six installable NexTalk courier transport `.ntx` bundles;
+- `nextalk-relay_checksums.txt`, covering all six `.ntx` files;
+- GitHub's release attestation, created automatically when immutable release publication completes.
 
-1. Make sure `main` is in the state you want to ship.
+The release workflow is the only supported way to create a release tag.
 
-2. Go to **Actions → Release → Run workflow** on GitHub.
+## Release workflow
 
-3. Fill in the version field (e.g. `v1.2.0`). It must start with `v` and follow [semver](https://semver.org/).
+1. Make sure `main` contains exactly the code you want to ship.
+2. Go to **Actions → Release → Run workflow**.
+3. Enter a new version such as `v0.2.0` or `v0.2.0-rc.1`.
+4. Select **Mark this as a pre-release** only for a pre-release.
+5. Run the workflow.
 
-4. Optionally tick **Mark as pre-release** for a beta or release candidate.
+The workflow performs these gates before publication:
 
-5. Click **Run workflow**. The workflow will:
-   - Validate the version string
-   - Create and push an annotated git tag (no-op if the tag already exists)
-   - Syntax-check all three workers (`shard`, `router`, `combined`)
-   - Generate a grouped changelog from Conventional Commit messages since the previous tag
-   - Create (or update) a GitHub Release with those notes
+1. validates that the release is being cut from `main`;
+2. checks all three Worker entry points with Node syntax validation;
+3. performs Wrangler dry-run deployment checks for `shard`, `router`, and `combined`;
+4. verifies the Go transport module with `gofmt`, `go vet`, and tests;
+5. creates or reuses a **draft** GitHub Release for the exact `main` commit;
+6. verifies that the release tag points to that exact commit;
+7. cross-compiles and packages six `.ntx` transport bundles;
+8. verifies every bundle, including its manifest, entry binary, ZIP structure, and SHA-256 checksum;
+9. creates a signed artifact attestation for the six transport bundles;
+10. uploads the exact expected asset set to the draft;
+11. verifies the draft asset inventory;
+12. publishes the release;
+13. verifies that the published release is immutable.
 
-That's it. No manual tagging, no manual `gh release create`.
+GitHub recommends creating immutable releases as drafts, attaching all assets, and publishing only after the asset set is complete.
 
-## Traditional tag flow
+## Release assets
 
-If you prefer tagging locally:
+Every release contains exactly seven transport-related assets:
 
-```bash
-git tag -a v1.2.0 -m "Release v1.2.0"
-git push origin v1.2.0
+```text
+nextalk-relay_<version>_linux_amd64.ntx
+nextalk-relay_<version>_linux_arm64.ntx
+nextalk-relay_<version>_linux_armv7.ntx
+nextalk-relay_<version>_darwin_amd64.ntx
+nextalk-relay_<version>_darwin_arm64.ntx
+nextalk-relay_<version>_windows_amd64.ntx
+nextalk-relay_checksums.txt
 ```
 
-The `release.yml` workflow also triggers on `push: tags: v*.*.*`, so it will run automatically and publish the GitHub Release the same way.
+Each `.ntx` bundle contains exactly `manifest.json` and the platform entry binary.
 
-## Commit convention
+The release workflow rewrites the manifest version inside the generated bundle to match the GitHub release version. It does not modify the repository's source manifest.
 
-The changelog groups commits by type — the grouping only works correctly if commits follow [Conventional Commits](../.github/CONTRIBUTING.md#commit-convention):
+The checksum file is generated from the final six `.ntx` files and is checked again with `sha256sum -c` before upload.
 
-| Prefix | Changelog group |
-|--------|-----------------|
-| `feat:` / `feat(scope):` | Features |
-| `fix:` / `fix(scope):` | Fixes |
-| `docs:` | Documentation |
-| `build:` / `perf:` / `refactor:` | Build & tooling |
-| everything else (non-`ci:`, non-merge) | Other |
+## Why tags are not pushed manually
 
-CI and merge commits are filtered out of the changelog automatically.
+Do **not** run:
+
+```bash
+git tag -a v0.2.0 -m "Release v0.2.0"
+git push origin v0.2.0
+```
+
+The release workflow creates the tag through `gh release create` while the release is still a draft. This avoids direct tag creation from the workflow and keeps the tag and release lifecycle together.
+
+When immutable releases are enabled, a published release locks its tag and assets. Even after deleting that immutable release, the same tag name cannot be reused. Choose a new version instead.
+
+## Re-running a release
+
+Re-running the workflow for a version is supported while that release remains a draft.
+
+The workflow will:
+
+- reuse an existing draft release;
+- refuse to modify a published or immutable release;
+- refuse to use a tag that points to a different commit;
+- replace matching draft assets with the freshly verified bundles.
+
+Once the release has been published and becomes immutable, do not reuse its version number. Pick the next semantic version instead.
 
 ## Versioning policy
 
-NexTalk-Relay follows **semantic versioning** from the operator's perspective:
+NexTalk-Relay follows Semantic Versioning from the API/operator perspective:
 
-- **Patch** (`v1.2.x`) — bug fixes and internal changes with no API or config changes
-- **Minor** (`v1.x.0`) — new endpoints, new optional config keys, backward-compatible changes
-- **Major** (`vX.0.0`) — breaking API changes, wire-format changes, removed endpoints, or renamed required config keys
+- **Patch** (`v1.2.x`): bug fixes and internal changes with no incompatible API or configuration changes.
+- **Minor** (`v1.x.0`): new endpoints, new optional configuration, and other backward-compatible functionality.
+- **Major** (`vX.0.0`): breaking API, wire-format, or required-configuration changes.
 
-## Deploying after a release
+## Deploying a released Worker
 
-A GitHub Release tag is a stable reference you can pin in deployment automation:
+The Worker code is released as the exact tagged source revision. Deployment remains a Cloudflare operation, not a release-asset upload.
 
 ```bash
-# Check out the release tag
-git checkout v1.2.0
+git checkout v0.2.0
 
-# Deploy shard
-cd shard && wrangler deploy
-
-# Deploy router
-cd ../router && wrangler deploy
+cd shard
+cp wrangler.toml.example wrangler.toml
+# fill in the production values
+wrangler deploy
 ```
 
-The `wrangler.toml.example` files in each directory document every required and optional configuration key for that version.
+Repeat for `router/` when operating a multi-shard deployment. For a single Worker deployment, deploy `combined/` instead.
+
+Never commit real `wrangler.toml` files, Cloudflare credentials, or worker secrets.
+
+## Manual transport packaging
+
+The transport can still be packaged locally for development:
+
+### Linux / macOS
+
+```bash
+cd transports/nextalk-relay
+./package.sh
+```
+
+### Windows
+
+```powershell
+cd transports/nextalk-relay
+.\package.ps1
+```
+
+Those helper scripts create a native development `nextalk-relay.ntx`. The release workflow is separate and cross-compiles the six published variants so that a release is independent of the machine that started it.
+
+## Conventional Commits
+
+Release notes are generated by GitHub from the commits included in the tagged release. Use Conventional Commit messages consistently:
+
+| Prefix | Meaning |
+|---|---|
+| `feat:` | New functionality |
+| `fix:` | Bug fix |
+| `docs:` | Documentation |
+| `refactor:` | Internal restructuring |
+| `perf:` | Performance |
+| `test:` | Tests |
+| `build:` | Build/tooling |
+| `ci:` | CI-only changes |
+| `chore:` | Maintenance |
+
+Do not put secrets, production credentials, or generated deployment state in release commits.
