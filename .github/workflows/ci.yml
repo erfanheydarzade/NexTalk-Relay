@@ -17,12 +17,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Syntax check — shard/worker.js
         run: node --check shard/worker.js
@@ -33,8 +33,10 @@ jobs:
       - name: Syntax check — combined/worker.js
         run: node --check combined/worker.js
 
-      - name: Install Wrangler
-        run: npm install -g wrangler
+      - name: Install pinned Wrangler
+        run: |
+          npm install -g wrangler@4.141.0
+          wrangler --version
 
       - name: Dry-run deploy check (shard)
         run: |
@@ -56,12 +58,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
-          go-version: "1.21.0"
+          go-version: "1.25.14"
 
       - name: Vet + test the .ntx courier bridge
         run: |
