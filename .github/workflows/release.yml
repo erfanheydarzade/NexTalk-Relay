@@ -139,6 +139,14 @@ jobs:
             exit 1
           fi
 
+      - name: Test browser (.wasm) extension
+        working-directory: transports
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in build-wasm.mjs tools/*.mjs test/*.mjs */wasm/build.mjs; do node --check "$f"; done
+          node --test test/wasm-package.test.mjs
+
       - name: Validate bridge module
         working-directory: transports/nextalk-relay
         shell: bash
@@ -364,6 +372,42 @@ jobs:
           echo "==> Six .ntx bundles verified:"
           ls -lh "$NTX_DIST"
 
+      - name: Set up Node (browser extension build)
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          check-latest: false
+
+      - name: Build browser (.wasm) extension
+        working-directory: transports
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="${TAG#v}"
+          WASM_TMP="$RUNNER_TEMP/wasm-dist"
+
+          node build-wasm.mjs --version "$VERSION" --out "$WASM_TMP"
+
+          OUT="$NTX_DIST/nextalk-relay-wasm_${VERSION}_browser.ntx"
+          cp "$WASM_TMP/nextalk-relay-wasm.ntx" "$OUT"
+
+          test -s "$OUT"
+          unzip -tq "$OUT"
+          test "$(unzip -Z1 "$OUT" | wc -l)" -eq 2
+
+          unzip -p "$OUT" manifest.json \
+            | jq -e --arg version "$VERSION" '
+                .id == "nextalk-relay-wasm"
+                and .version == $version
+                and .api_version == "1"
+                and .entry == "nextalk-relay.wasm"
+                and (.permissions | length) == 0
+              ' >/dev/null
+          unzip -Z1 "$OUT" | grep -qx 'nextalk-relay.wasm'
+
+          echo "Packaged: $OUT"
+
       - name: Generate and verify .ntx checksums
         shell: bash
         run: |
@@ -371,11 +415,12 @@ jobs:
 
           cd "$NTX_DIST"
 
-          sha256sum nextalk-relay_*.ntx > nextalk-relay_checksums.txt
+          sha256sum nextalk-relay_*.ntx nextalk-relay-wasm_*.ntx > nextalk-relay_checksums.txt
           sha256sum -c nextalk-relay_checksums.txt
 
           test -s nextalk-relay_checksums.txt
-          test "$(wc -l < nextalk-relay_checksums.txt)" -eq 6
+          # six native bundles + the browser (.wasm) bundle
+          test "$(wc -l < nextalk-relay_checksums.txt)" -eq 7
 
       - name: Install pinned Wrangler
         uses: actions/setup-node@v7
@@ -424,6 +469,7 @@ jobs:
             "$NTX_DIST/nextalk-relay_${TAG#v}_darwin_amd64.ntx"
             "$NTX_DIST/nextalk-relay_${TAG#v}_darwin_arm64.ntx"
             "$NTX_DIST/nextalk-relay_${TAG#v}_windows_amd64.ntx"
+            "$NTX_DIST/nextalk-relay-wasm_${TAG#v}_browser.ntx"
             "$NTX_DIST/nextalk-relay_checksums.txt"
           )
 
@@ -451,6 +497,7 @@ jobs:
             "nextalk-relay_${TAG#v}_linux_arm64.ntx"
             "nextalk-relay_${TAG#v}_linux_armv7.ntx"
             "nextalk-relay_${TAG#v}_windows_amd64.ntx"
+            "nextalk-relay-wasm_${TAG#v}_browser.ntx"
             "nextalk-relay_checksums.txt"
           )
 
@@ -493,7 +540,7 @@ jobs:
               and .isImmutable == true
               and .tagName == $tag
               and .isPrerelease == $prerelease
-              and (.assets | length) == 7
+              and (.assets | length) == 8
             ' <<< "$release_json" >/dev/null
 
           echo "Immutable release verified:"
