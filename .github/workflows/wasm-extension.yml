@@ -1,0 +1,87 @@
+name: WASM extension
+
+# Builds the browser (WebAssembly) package of the nextalk-relay transport and proves it
+# conforms to NexTalk's WASM transport ABI v1. Pure Node: no Go, TinyGo or
+# network is needed, and the output is byte-reproducible.
+#
+# Only the *extension* runs in the browser. The relay servers themselves
+# (routers / shards / daemons) are never built for WebAssembly.
+#
+# Artifacts are uploaded to the run; release assets are attached by release.yml
+# (so there is exactly one writer to a release).
+on:
+  push:
+    branches: [main]
+    paths:
+      - "transports/**"
+      - ".github/workflows/wasm-extension.yml"
+  pull_request:
+    paths:
+      - "transports/**"
+      - ".github/workflows/wasm-extension.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: wasm-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  wasm:
+    name: Build + verify browser extension (.ntx)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Syntax check
+        working-directory: transports
+        run: |
+          set -euo pipefail
+          for f in build-wasm.mjs tools/*.mjs test/*.mjs */wasm/build.mjs; do
+            node --check "$f"
+          done
+
+      - name: Tests (ABI v1 conformance, sandbox, policy, reproducibility)
+        working-directory: transports
+        run: node --test test/wasm-package.test.mjs
+
+      - name: Build
+        working-directory: transports
+        run: node build-wasm.mjs
+
+      - name: Reproducibility - a second build must be byte-identical
+        working-directory: transports
+        run: |
+          set -euo pipefail
+          cp dist/SHA256SUMS /tmp/first.sums
+          node build-wasm.mjs
+          diff /tmp/first.sums dist/SHA256SUMS
+          echo "reproducible:"; cat dist/SHA256SUMS
+
+      - name: Package contents are exactly manifest.json + the .wasm entry
+        working-directory: transports
+        run: |
+          set -euo pipefail
+          for p in dist/*.ntx; do
+            echo "== $p"; unzip -tq "$p"
+            test "$(unzip -Z1 "$p" | wc -l)" -eq 2
+            unzip -Z1 "$p" | grep -qx manifest.json
+            unzip -Z1 "$p" | grep -q '\.wasm$'
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nextalk-relay-wasm
+          path: |
+            transports/dist/*.ntx
+            transports/dist/SHA256SUMS
+          if-no-files-found: error
