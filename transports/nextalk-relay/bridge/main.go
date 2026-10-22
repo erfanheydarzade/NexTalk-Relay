@@ -499,6 +499,7 @@ func (b *bridge) onPoll(payload []byte) (uint8, []byte) {
 	b.mu.Unlock()
 	// Note: req.limit is intentionally not applied — see below.
 	var frames [][]byte
+	var firstErr error
 	ctx := bgCtx()
 	for _, mb := range targets {
 		// Relay /read is burn-after-read full-drain (no server-side limit),
@@ -507,9 +508,23 @@ func (b *bridge) onPoll(payload []byte) (uint8, []byte) {
 		// batches, and mailboxes cap at 50 server-side.
 		got, err := b.relay.readFromShard(ctx, mb.ShardURL, mb.MailboxID, mb.ReadSecret)
 		if err != nil {
-			return opError, errPayload(errTransport, err.Error())
+			// Mailboxes already read in this loop are drained server-side, so
+			// failing the whole poll here would silently lose their mail. Keep
+			// going, return what was drained, and surface the error only when
+			// there is nothing to return (the failed mailbox is retried on the
+			// next poll).
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
 		}
 		frames = append(frames, got...)
+	}
+	if firstErr != nil {
+		if len(frames) == 0 {
+			return opError, errPayload(errTransport, firstErr.Error())
+		}
+		fmt.Fprintf(os.Stderr, "bridge: poll: %v (returning %d frame(s) drained from other mailboxes)\n", firstErr, len(frames))
 	}
 	return opPoll, marshalPollResult(frames)
 }
