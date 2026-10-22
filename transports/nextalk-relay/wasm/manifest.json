@@ -1,0 +1,12 @@
+{
+  "id": "nextalk-relay-wasm",
+  "name": "NexTalk Relay (in-tab loopback)",
+  "version": "1.0.0",
+  "api_version": "1",
+  "entry": "nextalk-relay.wasm",
+  "capabilities": [
+    "message"
+  ],
+  "permissions": [],
+  "description": "Browser build of the NexTalk-Relay courier transport: an in-memory loopback queue running as WebAssembly inside the tab. It does not contact a Router or shard (WASM ABI v1 has no network); use the native nextalk-relay package for the real relay. No keys, opaque frames only."
+}
