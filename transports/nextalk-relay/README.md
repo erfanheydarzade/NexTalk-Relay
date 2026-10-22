@@ -68,8 +68,8 @@ failure. Never commit the built `.ntx` or `*.key` / `mailbox-map.json`
 
 ```bash
 nextalk transport install nextalk-relay.ntx --enable
-nextalk transport config nextalk-relay '{"router_url":"https://<your-router>.workers.dev"}'
-nextalk transport register nextalk-relay --user alice --router https://<your-router>.workers.dev
+nextalk transport config nextalk-relay '{\"router_url\":\"https://<your-router>.workers.dev\"}'
+nextalk transport register nextalk-relay --id <YOU> --router https://<your-router>.workers.dev
 # -> {"mailbox_id":"<32-hex alias>","read_secret":"...","shard_url":"..."}  (share alias+shard with senders)
 nextalk transport poll nextalk-relay -i <YOU>        # like worker listen
 nextalk transport send-frame nextalk-relay --to <PEER> -f frame.bin
@@ -103,6 +103,35 @@ cd ../bob && nextalk transport poll nextalk-relay -i BOB
 resolves via the Router itself); `--mailbox <alias> --shard <url>` targets
 an explicit address the recipient shared out-of-band.
 
+## Browser (WebAssembly) package
+
+NexTalk's browser build cannot spawn processes or touch a filesystem, so it only runs
+`.wasm` packages. This extension therefore also ships as **`nextalk-relay-wasm.ntx`**, built with
+Node alone (no Go, TinyGo or wat2wasm) and reproducible byte-for-byte:
+
+```bash
+cd transports
+node build-wasm.mjs                  # -> dist/nextalk-relay-wasm.ntx + dist/SHA256SUMS
+node build-wasm.mjs --version 1.4.0  # stamp manifest.version (the release workflow does this)
+node --test test/wasm-package.test.mjs
+```
+
+Every package is validated with NexTalk's manifest rules and checked against WASM
+transport **ABI v1** (exports, sandboxed imports, behaviour) before it is written. CI:
+`.github/workflows/wasm-extension.yml` builds, tests and uploads it on every change;
+`release.yml` attaches it to each release.
+
+**What it does — and does not.** ABI v1 gives a module linear memory plus an optional
+`ntx.log` import: no sockets, no `fetch`, no filesystem. So `nextalk-relay-wasm` is an
+in-memory loopback queue (`message` only, no permissions): frames sent in a tab come back out
+of the same tab. It is useful for trying the transport flow and for two identities in one tab,
+but it never contacts a Router or shard. Use the native `nextalk-relay.ntx` package for the real
+relay. The ids differ (`nextalk-relay` vs `nextalk-relay-wasm`), so both can be installed side by side. A
+networked browser build needs a host-mediated network import in the ABI first.
+
+Only the *extension* is built for the browser; the relay servers themselves are never
+compiled to or run in WebAssembly.
+
 ## Files
 
 ```
@@ -115,6 +144,7 @@ transports/nextalk-relay/
 │   ├── rpc.go             # transport API v1 codec (schemas 100–112, 123–126)
 │   ├── relay.go           # Router/shard JSON client (register/resolve/send/read)
 │   └── bridge_test.go     # codec + signing-format + httptest end-to-end
+├── wasm/                  # browser package: manifest.json, build.mjs, verify.json
 ├── package.sh / package.ps1
 └── README.md              # this file
 ```

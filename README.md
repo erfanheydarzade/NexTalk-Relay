@@ -219,7 +219,11 @@ NexTalk-Relay/
 │       │                       bridge + manifest + package scripts (see its README)
 │       ├── manifest.json      # Package metadata (manifest.windows.json for .exe)
 │       ├── bridge/            # Go stdio-RPC ↔ Relay-JSON bridge (message ops 1–10)
+│       ├── wasm/              # Browser (.wasm) package of the extension (loopback queue)
 │       └── package.sh / package.ps1  # Build nextalk-relay.ntx
+│   ├── build-wasm.mjs         # Build every browser package -> transports/dist (Node only)
+│   ├── tools/                 # .ntx packer, manifest validator, WASM ABI v1 verifier
+│   └── test/                  # Offline tests for the browser packages
 ├── scripts/
 │   ├── generate.py            # Generate all Router secrets (SERVER_SECRET, signing keypair)
 │   ├── generate.html          # Browser-based version of the same generator
@@ -229,6 +233,7 @@ NexTalk-Relay/
 └── .github/
     ├── workflows/
     │   ├── ci.yml             # Syntax check + wrangler dry-run on push/PR
+    │   ├── wasm-extension.yml # Build + verify the browser (.wasm) extension
     │   └── release.yml        # Button-triggered release with auto-generated changelog
     ├── CONTRIBUTING.md
     ├── SECURITY.md
@@ -239,7 +244,7 @@ NexTalk-Relay/
 
 ## Releasing
 
-Releases are cut with one button — see [`docs/RELEASING.md`](docs/RELEASING.md). Each immutable release contains the tagged Worker source revision plus six cross-platform `.ntx` courier transport bundles and their SHA-256 checksum file. The release notes are generated automatically from the commits included in the release.
+Releases are cut with one button — see [`docs/RELEASING.md`](docs/RELEASING.md). Each immutable release contains the tagged Worker source revision plus six cross-platform `.ntx` courier transport bundles, the browser (`.wasm`) extension bundle, and a SHA-256 checksum file covering all seven. The release notes are generated automatically from the commits included in the release.
 
 ## Interop with the NexTalk transport runtime
 
