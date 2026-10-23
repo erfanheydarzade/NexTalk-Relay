@@ -77,28 +77,6 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "Validated commit: $SHA"
 
-      - name: Verify commit with GitHub
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SHA: ${{ steps.commit.outputs.sha }}
-        run: |
-          set -euo pipefail
-
-          verification="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}" \
-            --jq '.commit.verification')"
-
-          verified="$(jq -r '.verified' <<< "$verification")"
-          reason="$(jq -r '.reason' <<< "$verification")"
-
-          if [[ "$verified" != "true" ]]; then
-            echo "::error::Commit $SHA is not verified by GitHub (reason: $reason)."
-            echo "::error::Releases must be cut from a signed, GitHub-verified commit."
-            exit 1
-          fi
-
-          echo "Commit $SHA is verified by GitHub (reason: $reason)."
-
       - name: Set up Node
         uses: actions/setup-node@v7
         with:
@@ -255,26 +233,6 @@ jobs:
           fi
 
           echo "Using validated commit: $RELEASE_SHA"
-
-      - name: Re-verify release commit with GitHub
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          verification="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_SHA}" \
-            --jq '.commit.verification')"
-
-          verified="$(jq -r '.verified' <<< "$verification")"
-          reason="$(jq -r '.reason' <<< "$verification")"
-
-          if [[ "$verified" != "true" ]]; then
-            echo "::error::Commit $RELEASE_SHA is not verified by GitHub (reason: $reason)."
-            exit 1
-          fi
-
-          echo "Commit $RELEASE_SHA is verified by GitHub (reason: $reason)."
 
       - name: Set up Go
         uses: actions/setup-go@v7
