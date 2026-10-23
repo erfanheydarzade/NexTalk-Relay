@@ -205,6 +205,15 @@ jobs:
           go vet ./...
           go test ./... -count=1
 
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+
+      - name: Scan Go bridge for known vulnerabilities
+        working-directory: transports/nextalk-relay
+        env:
+          GOFLAGS: -mod=readonly
+        run: govulncheck ./...
+
   release:
     name: Build and publish
     needs: validate
