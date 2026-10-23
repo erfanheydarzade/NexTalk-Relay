@@ -69,6 +69,7 @@ out/
 # ─── NexTalk transport packages (transports/nextalk-relay/) ──────────────────
 # .ntx files are release artifacts: zip of manifest.json + entry binary.
 *.ntx
+*.zip
 nextalk-relay-bridge
 nextalk-relay-bridge.exe
 # Bridge runtime state (secrets — never commit; *.key already covers
