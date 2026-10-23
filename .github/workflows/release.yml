@@ -1,9 +1,15 @@
 name: Release
 
 # Releases are created from this workflow only.
-# The workflow creates a DRAFT release targeting the selected main commit,
-# builds and verifies the Workers plus the installable .ntx courier
-# transport bundles, uploads every asset, then publishes the release.
+# The workflow verifies the selected main commit with GitHub (signature),
+# validates the Workers, the Go bridge and the browser (.wasm) extension,
+# creates a DRAFT release targeting that commit, builds and verifies the
+# installable .ntx courier transport bundles (6 native + 1 browser),
+# uploads every asset, then publishes the release.
+#
+# This workflow supersedes wasm-extension.yml: every check from it
+# (syntax, ABI v1 conformance tests, build, reproducibility, package
+# contents) now runs here, and the artifact upload is kept.
 #
 # Do not push release tags manually. With GitHub release immutability enabled,
 # a published tag is permanently bound to its release and cannot be reused.
@@ -71,6 +77,28 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "Validated commit: $SHA"
 
+      - name: Verify commit with GitHub
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          verification="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}" \
+            --jq '.commit.verification')"
+
+          verified="$(jq -r '.verified' <<< "$verification")"
+          reason="$(jq -r '.reason' <<< "$verification")"
+
+          if [[ "$verified" != "true" ]]; then
+            echo "::error::Commit $SHA is not verified by GitHub (reason: $reason)."
+            echo "::error::Releases must be cut from a signed, GitHub-verified commit."
+            exit 1
+          fi
+
+          echo "Commit $SHA is verified by GitHub (reason: $reason)."
+
       - name: Set up Node
         uses: actions/setup-node@v7
         with:
@@ -111,19 +139,7 @@ jobs:
             (
               cd "$worker"
               cp wrangler.toml.example wrangler.toml
-
-              case "$worker" in
-                shard)
-                  wrangler deploy --dry-run --outdir "$RUNNER_TEMP/shard-build"
-                  ;;
-                router)
-                  wrangler deploy --dry-run --outdir "$RUNNER_TEMP/router-build"
-                  ;;
-                combined)
-                  wrangler deploy --dry-run --outdir "$RUNNER_TEMP/combined-build"
-                  ;;
-              esac
-
+              wrangler deploy --dry-run --outdir "$RUNNER_TEMP/${worker}-build"
               rm -f wrangler.toml
             )
           done
@@ -139,13 +155,41 @@ jobs:
             exit 1
           fi
 
-      - name: Test browser (.wasm) extension
+      - name: WASM extension - syntax check
         working-directory: transports
         shell: bash
         run: |
           set -euo pipefail
-          for f in build-wasm.mjs tools/*.mjs test/*.mjs */wasm/build.mjs; do node --check "$f"; done
+          for f in build-wasm.mjs tools/*.mjs test/*.mjs */wasm/build.mjs; do
+            node --check "$f"
+          done
+
+      - name: WASM extension - tests (ABI v1 conformance, sandbox, policy, reproducibility)
+        working-directory: transports
+        shell: bash
+        run: |
+          set -euo pipefail
           node --test test/wasm-package.test.mjs
+
+      - name: WASM extension - build twice and require byte-identical output
+        working-directory: transports
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          node build-wasm.mjs --out "$RUNNER_TEMP/wasm-check-1"
+          node build-wasm.mjs --out "$RUNNER_TEMP/wasm-check-2"
+
+          diff -r "$RUNNER_TEMP/wasm-check-1" "$RUNNER_TEMP/wasm-check-2"
+          echo "WASM build is reproducible."
+
+          for p in "$RUNNER_TEMP"/wasm-check-1/*.ntx; do
+            echo "== $p"
+            unzip -tq "$p"
+            test "$(unzip -Z1 "$p" | wc -l)" -eq 2
+            unzip -Z1 "$p" | grep -qx manifest.json
+            unzip -Z1 "$p" | grep -q '\.wasm$'
+          done
 
       - name: Validate bridge module
         working-directory: transports/nextalk-relay
@@ -187,13 +231,6 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.validate.outputs.commit_sha }}
 
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: "${{ env.GO_VERSION }}"
-          cache: true
-          cache-dependency-path: transports/nextalk-relay/go.sum
-
       - name: Verify validated release commit
         shell: bash
         run: |
@@ -210,6 +247,46 @@ jobs:
 
           echo "Using validated commit: $RELEASE_SHA"
 
+      - name: Re-verify release commit with GitHub
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          verification="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_SHA}" \
+            --jq '.commit.verification')"
+
+          verified="$(jq -r '.verified' <<< "$verification")"
+          reason="$(jq -r '.reason' <<< "$verification")"
+
+          if [[ "$verified" != "true" ]]; then
+            echo "::error::Commit $RELEASE_SHA is not verified by GitHub (reason: $reason)."
+            exit 1
+          fi
+
+          echo "Commit $RELEASE_SHA is verified by GitHub (reason: $reason)."
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "${{ env.GO_VERSION }}"
+          cache: true
+          cache-dependency-path: transports/nextalk-relay/go.sum
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          check-latest: false
+
+      - name: Install pinned Wrangler
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global wrangler@4.141.0
+          wrangler --version
+
       - name: Prepare draft GitHub release
         id: prepare
         shell: bash
@@ -218,7 +295,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          if release_json="$(gh release view "$TAG"             --repo "${GITHUB_REPOSITORY}"             --json isDraft,isImmutable,tagName,targetCommitish,url 2>/dev/null)"; then
+          NOTES="Cloudflare Workers relay release with installable NexTalk .ntx courier transport bundles (native and browser .wasm)."
+
+          if release_json="$(gh release view "$TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json isDraft,isImmutable,tagName,targetCommitish,url 2>/dev/null)"; then
 
             is_draft="$(jq -r '.isDraft' <<< "$release_json")"
             is_immutable="$(jq -r '.isImmutable' <<< "$release_json")"
@@ -244,10 +325,22 @@ jobs:
               fi
 
               echo "Creating draft release for existing tag $TAG."
-              gh release create "$TAG"                 --repo "${GITHUB_REPOSITORY}"                 --draft                 --verify-tag                 --title "NexTalk-Relay $TAG"                 --notes "Cloudflare Workers relay release with installable NexTalk .ntx courier transport bundles."                 --generate-notes
+              gh release create "$TAG" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --draft \
+                --verify-tag \
+                --title "NexTalk-Relay $TAG" \
+                --notes "$NOTES" \
+                --generate-notes
             else
               echo "Creating draft release $TAG at $RELEASE_SHA."
-              gh release create "$TAG"                 --repo "${GITHUB_REPOSITORY}"                 --draft                 --target "$RELEASE_SHA"                 --title "NexTalk-Relay $TAG"                 --notes "Cloudflare Workers relay release with installable NexTalk .ntx courier transport bundles."                 --generate-notes
+              gh release create "$TAG" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --draft \
+                --target "$RELEASE_SHA" \
+                --title "NexTalk-Relay $TAG" \
+                --notes "$NOTES" \
+                --generate-notes
             fi
 
             echo "created=true" >> "$GITHUB_OUTPUT"
@@ -260,9 +353,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          release_json="$(gh release view "$TAG"             --repo "${GITHUB_REPOSITORY}"             --json isDraft,isImmutable,tagName,targetCommitish)"
+          release_json="$(gh release view "$TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json isDraft,isImmutable,tagName,targetCommitish)"
 
-          jq -e             --arg tag "$TAG"             --arg sha "$RELEASE_SHA"             '
+          jq -e \
+            --arg tag "$TAG" \
+            --arg sha "$RELEASE_SHA" \
+            '
               .isDraft == true
               and .isImmutable == false
               and .tagName == $tag
@@ -282,7 +380,7 @@ jobs:
           rm -rf "$NTX_DIST"
           mkdir -p "$NTX_DIST"
 
-      - name: Build six .ntx courier bundles
+      - name: Build six native .ntx courier bundles
         working-directory: transports/nextalk-relay
         shell: bash
         env:
@@ -314,22 +412,32 @@ jobs:
             mkdir -p .ntx-stage
 
             if [[ -n "$goarm" ]]; then
-              GOOS="$goos" GOARCH="$goarch" GOARM="$goarm" CGO_ENABLED=0                 go build -trimpath -ldflags="-s -w" -o "$entry" ./bridge
+              GOOS="$goos" GOARCH="$goarch" GOARM="$goarm" CGO_ENABLED=0 \
+                go build -trimpath -ldflags="-s -w" -o "$entry" ./bridge
             else
-              GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0                 go build -trimpath -ldflags="-s -w" -o "$entry" ./bridge
+              GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
+                go build -trimpath -ldflags="-s -w" -o "$entry" ./bridge
             fi
 
             test -s "$entry"
 
-            jq --arg version "$VERSION"               '.version = $version'               "$manifest"               > .ntx-stage/manifest.json
+            jq --arg version "$VERSION" \
+              '.version = $version' \
+              "$manifest" \
+              > .ntx-stage/manifest.json
 
-            jq -e               --arg version "$VERSION"               --arg id "nextalk-relay"               --arg entry "$entry"               '
+            jq -e \
+              --arg version "$VERSION" \
+              --arg id "nextalk-relay" \
+              --arg entry "$entry" \
+              '
                 .id == $id
                 and .version == $version
                 and .api_version == "1"
                 and .entry == $entry
                 and (.capabilities | index("message")) != null
-              '               .ntx-stage/manifest.json >/dev/null
+              ' \
+              .ntx-stage/manifest.json >/dev/null
 
             cp "$entry" .ntx-stage/
 
@@ -344,7 +452,12 @@ jobs:
             test -s "$OUT"
             unzip -tq "$OUT"
 
-            unzip -p "$OUT" manifest.json               | jq -e                   --arg version "$VERSION"                   --arg entry "$entry"                   '.version == $version and .entry == $entry'               >/dev/null
+            unzip -p "$OUT" manifest.json \
+              | jq -e \
+                  --arg version "$VERSION" \
+                  --arg entry "$entry" \
+                  '.version == $version and .entry == $entry' \
+                >/dev/null
 
             unzip -l "$OUT" | grep -Eq '[[:space:]]manifest\.json$'
             unzip -l "$OUT" | grep -Eq "[[:space:]]${entry//./\.}$"
@@ -363,22 +476,16 @@ jobs:
 
           count="$(find "$NTX_DIST" -maxdepth 1 -type f -name '*.ntx' | wc -l)"
           if [[ "$count" -ne 6 ]]; then
-            echo "::error::Expected exactly 6 .ntx bundles, found $count."
+            echo "::error::Expected exactly 6 native .ntx bundles, found $count."
             find "$NTX_DIST" -maxdepth 1 -type f -print
             exit 1
           fi
 
           echo
-          echo "==> Six .ntx bundles verified:"
+          echo "==> Six native .ntx bundles verified:"
           ls -lh "$NTX_DIST"
 
-      - name: Set up Node (browser extension build)
-        uses: actions/setup-node@v7
-        with:
-          node-version: "24"
-          check-latest: false
-
-      - name: Build browser (.wasm) extension
+      - name: Build and verify browser (.wasm) extension
         working-directory: transports
         shell: bash
         run: |
@@ -386,15 +493,24 @@ jobs:
 
           VERSION="${TAG#v}"
           WASM_TMP="$RUNNER_TEMP/wasm-dist"
+          WASM_TMP2="$RUNNER_TEMP/wasm-dist-repro"
 
           node build-wasm.mjs --version "$VERSION" --out "$WASM_TMP"
+
+          # Reproducibility: a second build must be byte-identical.
+          node build-wasm.mjs --version "$VERSION" --out "$WASM_TMP2"
+          diff -r "$WASM_TMP" "$WASM_TMP2"
+          echo "WASM build is reproducible."
 
           OUT="$NTX_DIST/nextalk-relay-wasm_${VERSION}_browser.ntx"
           cp "$WASM_TMP/nextalk-relay-wasm.ntx" "$OUT"
 
+          # Package contents are exactly manifest.json + the .wasm entry.
           test -s "$OUT"
           unzip -tq "$OUT"
           test "$(unzip -Z1 "$OUT" | wc -l)" -eq 2
+          unzip -Z1 "$OUT" | grep -qx 'manifest.json'
+          unzip -Z1 "$OUT" | grep -qx 'nextalk-relay.wasm'
 
           unzip -p "$OUT" manifest.json \
             | jq -e --arg version "$VERSION" '
@@ -404,7 +520,12 @@ jobs:
                 and .entry == "nextalk-relay.wasm"
                 and (.permissions | length) == 0
               ' >/dev/null
-          unzip -Z1 "$OUT" | grep -qx 'nextalk-relay.wasm'
+
+          # Keep the build's own checksums for the run artifact.
+          if [[ -f "$WASM_TMP/SHA256SUMS" ]]; then
+            cp "$WASM_TMP/SHA256SUMS" "$RUNNER_TEMP/wasm-SHA256SUMS"
+            echo "WASM_SUMS=$RUNNER_TEMP/wasm-SHA256SUMS" >> "$GITHUB_ENV"
+          fi
 
           echo "Packaged: $OUT"
 
@@ -422,19 +543,6 @@ jobs:
           # six native bundles + the browser (.wasm) bundle
           test "$(wc -l < nextalk-relay_checksums.txt)" -eq 7
 
-      - name: Install pinned Wrangler
-        uses: actions/setup-node@v7
-        with:
-          node-version: "24"
-          check-latest: false
-
-      - name: Install Wrangler CLI
-        shell: bash
-        run: |
-          set -euo pipefail
-          npm install --global wrangler@4.141.0
-          wrangler --version
-
       - name: Final source sanity check
         shell: bash
         run: |
@@ -449,6 +557,15 @@ jobs:
             git status --short
             exit 1
           fi
+
+      - name: Upload .ntx bundles as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextalk-relay-ntx
+          path: |
+            ${{ env.NTX_DIST }}/*.ntx
+            ${{ env.NTX_DIST }}/nextalk-relay_checksums.txt
+          if-no-files-found: error
 
       - name: Generate .ntx artifact attestation
         uses: actions/attest@v4
@@ -477,7 +594,9 @@ jobs:
             test -s "$asset"
           done
 
-          gh release upload "$TAG" "${assets[@]}"             --repo "${GITHUB_REPOSITORY}"             --clobber
+          gh release upload "$TAG" "${assets[@]}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
 
       - name: Verify draft release
         shell: bash
@@ -487,7 +606,11 @@ jobs:
           set -euo pipefail
 
           mapfile -t actual < <(
-            gh release view "$TAG"               --repo "${GITHUB_REPOSITORY}"               --json isDraft,isImmutable,tagName,targetCommitish,assets               --jq '.assets[].name'               | sort
+            gh release view "$TAG" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json isDraft,isImmutable,tagName,targetCommitish,assets \
+              --jq '.assets[].name' \
+              | sort
           )
 
           expected=(
@@ -519,9 +642,15 @@ jobs:
           set -euo pipefail
 
           if [[ "$PRERELEASE" == "true" ]]; then
-            gh release edit "$TAG"               --repo "${GITHUB_REPOSITORY}"               --draft=false               --prerelease
+            gh release edit "$TAG" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --draft=false \
+              --prerelease
           else
-            gh release edit "$TAG"               --repo "${GITHUB_REPOSITORY}"               --draft=false               --prerelease=false
+            gh release edit "$TAG" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --draft=false \
+              --prerelease=false
           fi
 
           echo "Published $TAG"
@@ -533,12 +662,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          release_json="$(gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" --json isDraft,isImmutable,isPrerelease,tagName,assets,url)"
+          release_json="$(gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" --json isDraft,isImmutable,isPrerelease,tagName,targetCommitish,assets,url)"
 
-          jq -e --arg tag "$TAG" --argjson prerelease "$PRERELEASE" '
+          jq -e --arg tag "$TAG" --arg sha "$RELEASE_SHA" --argjson prerelease "$PRERELEASE" '
               .isDraft == false
               and .isImmutable == true
               and .tagName == $tag
+              and .targetCommitish == $sha
               and .isPrerelease == $prerelease
               and (.assets | length) == 8
             ' <<< "$release_json" >/dev/null
@@ -563,7 +693,9 @@ jobs:
         run: |
           set +e
 
-          release_json="$(gh release view "$TAG"             --repo "${GITHUB_REPOSITORY}"             --json isDraft,isImmutable 2>/dev/null)"
+          release_json="$(gh release view "$TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json isDraft,isImmutable 2>/dev/null)"
 
           if [[ -z "$release_json" ]]; then
             echo "Release $TAG is not readable; leaving state untouched."
