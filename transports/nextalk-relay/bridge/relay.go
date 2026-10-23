@@ -52,7 +52,7 @@ type resolution struct {
 // that has never been provisioned — the recipient has not registered this
 // identity with the Router. Distinct from a transport failure: retrying will
 // not help until they register.
-var errMailboxNotRegistered = errors.New("recipient mailbox is not registered on the relay (they must register this identity's pubkey with the Router)")
+var errMailboxNotRegistered = errors.New("recipient mailbox is not registered on the relay (the recipient must run `transport register-identity` against this same Router; `transport register` only mints a file-transfer mailbox)")
 
 type senderAuth struct {
 	PubKey    string `json:"pubkey"`
