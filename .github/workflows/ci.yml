@@ -74,9 +74,9 @@ jobs:
           fi
 
   bridge:
-    name: Bridge Build & Test
+    name: Bridge Build, Test & Vulnerability Scan
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       GOFLAGS: -mod=readonly
     steps:
@@ -100,6 +100,13 @@ jobs:
           go vet ./...
           go test ./... -count=1
 
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+
+      - name: Scan Go bridge for known vulnerabilities
+        working-directory: transports/nextalk-relay
+        run: govulncheck ./...
+
       - name: Package check (manifest + entry at zip root)
         run: |
           cd transports/nextalk-relay
@@ -112,7 +119,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Pure Node: no Go, TinyGo or network needed, and output is byte-reproducible.
-    # Only the *extension* runs in the browser; relay servers are never built for WebAssembly.
+    # Only the extension runs in the browser; relay servers are never built for WebAssembly.
     steps:
       - name: Checkout
         uses: actions/checkout@v7
