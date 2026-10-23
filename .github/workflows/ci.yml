@@ -1,10 +1,19 @@
 name: CI
 
+# Runs on every push/PR to main. Mirrors the validation done by release.yml
+# (Workers, Go bridge, browser .wasm extension) so a release never fails on
+# something CI could have caught earlier. Release assets are still published
+# only by release.yml (exactly one writer to a release).
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 # Cancel superseded runs on the same branch/PR to save CI minutes.
 concurrency:
@@ -15,6 +24,7 @@ jobs:
   check:
     name: Syntax & Dry-Run Check
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -53,9 +63,22 @@ jobs:
           cp combined/wrangler.toml.example combined/wrangler.toml
           cd combined && wrangler deploy --dry-run --outdir /tmp/combined-build
 
+      - name: Verify dry-runs left no tracked worktree changes
+        run: |
+          set -euo pipefail
+          # wrangler.toml copies are expected to be git-ignored; anything else is a leak.
+          if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+            echo "::error::Worker validation modified tracked files."
+            git status --short
+            exit 1
+          fi
+
   bridge:
     name: Bridge Build & Test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GOFLAGS: -mod=readonly
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -64,10 +87,16 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version: "1.25.14"
+          cache: true
+          cache-dependency-path: transports/nextalk-relay/go.sum
 
-      - name: Vet + test the .ntx courier bridge
+      - name: Verify modules, formatting, vet and tests
+        working-directory: transports/nextalk-relay
         run: |
-          cd transports/nextalk-relay
+          set -euo pipefail
+          go mod download
+          go mod verify
+          test -z "$(gofmt -l .)"
           go vet ./...
           go test ./... -count=1
 
@@ -77,3 +106,63 @@ jobs:
           bash ./package.sh
           unzip -l nextalk-relay.ntx
           rm -f nextalk-relay.ntx nextalk-relay-bridge
+
+  wasm:
+    name: Browser extension (.wasm / .ntx)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Pure Node: no Go, TinyGo or network needed, and output is byte-reproducible.
+    # Only the *extension* runs in the browser; relay servers are never built for WebAssembly.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Syntax check
+        working-directory: transports
+        run: |
+          set -euo pipefail
+          for f in build-wasm.mjs tools/*.mjs test/*.mjs */wasm/build.mjs; do
+            node --check "$f"
+          done
+
+      - name: Tests (ABI v1 conformance, sandbox, policy, reproducibility)
+        working-directory: transports
+        run: node --test test/wasm-package.test.mjs
+
+      - name: Build
+        working-directory: transports
+        run: node build-wasm.mjs
+
+      - name: Reproducibility — a second build must be byte-identical
+        working-directory: transports
+        run: |
+          set -euo pipefail
+          cp dist/SHA256SUMS /tmp/first.sums
+          node build-wasm.mjs
+          diff /tmp/first.sums dist/SHA256SUMS
+          echo "reproducible:"; cat dist/SHA256SUMS
+
+      - name: Package contents are exactly manifest.json + the .wasm entry
+        working-directory: transports
+        run: |
+          set -euo pipefail
+          for p in dist/*.ntx; do
+            echo "== $p"; unzip -tq "$p"
+            test "$(unzip -Z1 "$p" | wc -l)" -eq 2
+            unzip -Z1 "$p" | grep -qx manifest.json
+            unzip -Z1 "$p" | grep -q '\.wasm$'
+          done
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextalk-relay-wasm
+          path: |
+            transports/dist/*.ntx
+            transports/dist/SHA256SUMS
+          if-no-files-found: error
