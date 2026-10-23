@@ -3,8 +3,9 @@
 NexTalk-Relay releases are immutable GitHub Releases built from a commit on `main`. Each release contains:
 
 - the tagged source revision used to deploy the Cloudflare Workers;
-- six installable NexTalk courier transport `.ntx` bundles;
-- `nextalk-relay_checksums.txt`, covering all six `.ntx` files;
+- six installable NexTalk courier transport `.ntx` bundles (native, one per platform);
+- one browser (WebAssembly) `.ntx` bundle of the extension;
+- `nextalk-relay_checksums.txt`, covering all seven `.ntx` files;
 - GitHub's release attestation, created automatically when immutable release publication completes.
 
 The release workflow is the only supported way to create a release tag.
@@ -22,12 +23,12 @@ The workflow performs these gates before publication:
 1. validates that the release is being cut from `main`;
 2. checks all three Worker entry points with Node syntax validation;
 3. performs Wrangler dry-run deployment checks for `shard`, `router`, and `combined`;
-4. verifies the Go transport module with `gofmt`, `go vet`, and tests;
+4. verifies the Go transport module with `gofmt`, `go vet`, and tests, and tests the browser (`.wasm`) extension build;
 5. creates or reuses a **draft** GitHub Release for the exact `main` commit;
 6. verifies that the release tag points to that exact commit;
-7. cross-compiles and packages six `.ntx` transport bundles;
+7. cross-compiles and packages six `.ntx` transport bundles, and builds the browser bundle (Node only, no Go) stamped with the release version;
 8. verifies every bundle, including its manifest, entry binary, ZIP structure, and SHA-256 checksum;
-9. creates a signed artifact attestation for the six transport bundles;
+9. creates a signed artifact attestation for all seven transport bundles;
 10. uploads the exact expected asset set to the draft;
 11. verifies the draft asset inventory;
 12. publishes the release;
@@ -37,7 +38,7 @@ GitHub recommends creating immutable releases as drafts, attaching all assets, a
 
 ## Release assets
 
-Every release contains exactly seven transport-related assets:
+Every release contains exactly eight transport-related assets:
 
 ```text
 nextalk-relay_<version>_linux_amd64.ntx
@@ -46,14 +47,15 @@ nextalk-relay_<version>_linux_armv7.ntx
 nextalk-relay_<version>_darwin_amd64.ntx
 nextalk-relay_<version>_darwin_arm64.ntx
 nextalk-relay_<version>_windows_amd64.ntx
+nextalk-relay-wasm_<version>_browser.ntx
 nextalk-relay_checksums.txt
 ```
 
-Each `.ntx` bundle contains exactly `manifest.json` and the platform entry binary.
+Each native `.ntx` bundle contains exactly `manifest.json` and the platform entry binary. The browser bundle contains exactly `manifest.json` and `nextalk-relay.wasm`; it is an in-tab loopback queue (WASM transport ABI v1 has no network), so it is a complement to, not a replacement for, the native bundles.
 
 The release workflow rewrites the manifest version inside the generated bundle to match the GitHub release version. It does not modify the repository's source manifest.
 
-The checksum file is generated from the final six `.ntx` files and is checked again with `sha256sum -c` before upload.
+The checksum file is generated from the final seven `.ntx` files and is checked again with `sha256sum -c` before upload.
 
 ## Why tags are not pushed manually
 

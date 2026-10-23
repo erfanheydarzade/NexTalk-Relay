@@ -475,3 +475,46 @@ func TestServeLoopStdio(t *testing.T) {
 		t.Fatalf("stdio status after start must report running: op=%d", op)
 	}
 }
+
+// /read is burn-after-read, so one failing mailbox must not discard the frames
+// already drained from the others (the failed one is simply retried next poll).
+func TestPollPartialFailureKeepsDrainedFrames(t *testing.T) {
+	badID := strings.Repeat("ef", 32)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/read", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("mailbox_id") != testMailboxFull {
+			http.Error(w, `{"error":"boom"}`, 500)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"messages": []any{map[string]any{
+				"id": "m1", "time": 1,
+				"message": base64.StdEncoding.EncodeToString([]byte{0x03, 'o', 'k'}),
+			}},
+			"count": 1, "createdAt": 1, "consumed": true,
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := testBridge(t)
+	b.attached["aa"] = &binding{MailboxID: testMailboxFull, ReadSecret: testSecretFull, ShardURL: srv.URL}
+	b.attached["bb"] = &binding{MailboxID: badID, ReadSecret: testSecretFull, ShardURL: srv.URL}
+
+	// No mailbox field: poll every attached mailbox (map order is random, so this
+	// holds whichever of the two is read first).
+	op, res := b.onPoll(mustEncode(t, encPair(1, []byte{32})))
+	if op != opPoll {
+		t.Fatalf("poll with one healthy mailbox must succeed, got op=%d %q", op, res)
+	}
+	blob := fieldByID(t, res, 1)
+	if len(blob) < 4 || string(blob[4:]) != string([]byte{0x03, 'o', 'k'}) {
+		t.Fatalf("drained frame was lost: %x", blob)
+	}
+
+	// Every mailbox failing is still an error.
+	delete(b.attached, "aa")
+	if op, _ := b.onPoll(mustEncode(t, encPair(1, []byte{32}))); op != opError {
+		t.Fatalf("poll with only failing mailboxes must error, got op=%d", op)
+	}
+}
